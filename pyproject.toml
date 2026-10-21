@@ -47,11 +47,11 @@ wechatbot = "bot:main"
 wechatbot-webui = "config_editor:main"
 
 [tool.setuptools]
-py-modules = ["bot", "config", "config_editor", "run", "test_bot", "wxbot"]
+py-modules = ["bot", "bot_runtime", "config", "config_editor", "run", "test_bot", "wxbot", "app_config", "capabilities", "llm_errors", "reminder_rules", "group_rules", "url_safety", "file_io", "forum_routes", "store_io", "audit", "module_install", "llm_client", "memory_store", "reminders", "webui_data"]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["emojis*", "prompts*", "templates*", "Demo_Image*", "forum_data*"]
+include = ["emojis*", "prompts*", "templates*", "Demo_Image*", "forum_data*", "message*", "static*"]
 
 [tool.setuptools.package-data]
 "*" = ["*", "*/*", "*/*/*", "*/*/*/*"]

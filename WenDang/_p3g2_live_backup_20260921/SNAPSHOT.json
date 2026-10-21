@@ -1,0 +1,29 @@
+{
+  "test_start_local": "2026-09-21T14:24:56+08:00",
+  "listen_list": [
+    [
+      "ceshi",
+      "企业_1"
+    ],
+    [
+      "哈",
+      "企业_1"
+    ],
+    [
+      "QIYE",
+      "QIYE"
+    ]
+  ],
+  "conversation": {
+    "id": "conv_6fbe0f455b94",
+    "platform_conversation_id": "58847495172@chatroom",
+    "display_name": "QIYE",
+    "agent_config_id": "agt_38b43979a544",
+    "chat_prompt_name": "QIYE",
+    "extractor_prompt_name": "TOPIC_EXTRACTOR"
+  },
+  "other_agent_extractor_untouched": null,
+  "topic_store_backup": "ABSENT (no production writes yet)",
+  "enabled_flag": "true",
+  "listen_list_unchanged": true
+}

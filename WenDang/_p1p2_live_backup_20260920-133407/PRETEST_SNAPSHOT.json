@@ -1,0 +1,102 @@
+{
+  "LISTEN_LIST": [
+    [
+      "ceshi",
+      "企业_1"
+    ],
+    [
+      "哈",
+      "企业_1"
+    ],
+    [
+      "QIYE",
+      "QIYE"
+    ]
+  ],
+  "CONVERSATIONS": [
+    {
+      "id": "conv_b35d9b7aaba2",
+      "platform": "WECHAT",
+      "platform_conversation_id": "wxid_rvzydi2xoif022",
+      "conversation_type": "PRIVATE",
+      "display_name": "ceshi",
+      "enabled": true,
+      "agent_config_id": "agt_679873182096",
+      "reply_policy": "INHERIT",
+      "permission_scope": "DEFAULT",
+      "metadata": {
+        "nickname": "ceshi",
+        "source": "listen_list_v1",
+        "prompt_name": "企业_1"
+      },
+      "created_at": "2026-09-20T03:07:59Z",
+      "updated_at": "2026-09-20T05:34:05Z"
+    },
+    {
+      "id": "conv_2f82b3dbce7e",
+      "platform": "WECHAT",
+      "platform_conversation_id": "51989154176@chatroom",
+      "conversation_type": "GROUP",
+      "display_name": "哈",
+      "enabled": true,
+      "agent_config_id": "agt_679873182096",
+      "reply_policy": "INHERIT",
+      "permission_scope": "DEFAULT",
+      "metadata": {
+        "nickname": "哈",
+        "source": "listen_list_v1",
+        "prompt_name": "企业_1"
+      },
+      "created_at": "2026-09-20T03:07:59Z",
+      "updated_at": "2026-09-20T05:34:05Z"
+    },
+    {
+      "id": "conv_6fbe0f455b94",
+      "platform": "WECHAT",
+      "platform_conversation_id": "58847495172@chatroom",
+      "conversation_type": "GROUP",
+      "display_name": "QIYE",
+      "enabled": true,
+      "agent_config_id": "agt_38b43979a544",
+      "reply_policy": "INHERIT",
+      "permission_scope": "DEFAULT",
+      "metadata": {
+        "nickname": "QIYE",
+        "source": "listen_list_v1",
+        "prompt_name": "QIYE"
+      },
+      "created_at": "2026-09-20T03:07:59Z",
+      "updated_at": "2026-09-20T05:34:05Z"
+    }
+  ],
+  "AGENT_CONFIGS": [
+    {
+      "id": "agt_679873182096",
+      "name": "智群 · 项目协同 Agent · 企业_1",
+      "agent_type": "PROJECT_COLLABORATION",
+      "enabled": true,
+      "chat_prompt_name": "企业_1",
+      "chat_prompt_hash": "3ee543e315c3ec89d4266e2aba3b85621df3cb64cacd2a9b03f855bfbc94ca99",
+      "extractor_prompt_name": null,
+      "reply_policy": "INHERIT",
+      "model_config": "INHERIT",
+      "context_policy": "INHERIT",
+      "created_at": "2026-09-20T03:07:59Z",
+      "updated_at": "2026-09-20T03:07:59Z"
+    },
+    {
+      "id": "agt_38b43979a544",
+      "name": "智群 · 项目协同 Agent · QIYE",
+      "agent_type": "PROJECT_COLLABORATION",
+      "enabled": true,
+      "chat_prompt_name": "QIYE",
+      "chat_prompt_hash": "4dfc85f9728f936f7eb60279330e3b44bdf3f7b6ee35ef04fa45764d8c77559d",
+      "extractor_prompt_name": null,
+      "reply_policy": "INHERIT",
+      "model_config": "INHERIT",
+      "context_policy": "INHERIT",
+      "created_at": "2026-09-20T03:07:59Z",
+      "updated_at": "2026-09-20T03:07:59Z"
+    }
+  ]
+}

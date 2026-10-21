@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>处理状态</title>
+    <style>
+        body { margin: 0; font-family: "Segoe UI", "PingFang SC", sans-serif; background: #f4f6f8; color: #1f2933; }
+        header { background: #1f2933; color: #fff; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+        header a { color: #d9e2ec; text-decoration: none; }
+        main { padding: 20px 24px 40px; max-width: 1200px; }
+        h1 { font-size: 20px; margin: 0; font-weight: 600; }
+        h2 { font-size: 16px; margin: 0 0 12px; }
+        section { background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+        .table-wrap { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border-bottom: 1px solid #e4e7eb; text-align: left; padding: 8px 6px; vertical-align: top; }
+        th { color: #52606d; font-weight: 600; background: #f8fafc; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 16px; }
+        .label { color: #7b8794; font-size: 12px; }
+        .value { font-size: 14px; margin-top: 2px; }
+        .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; line-height: 1.6; white-space: nowrap; }
+        .tag-success { background: #e3f9e5; color: #0e6245; }
+        .tag-failed { background: #ffe8e6; color: #9b1c1c; }
+        .tag-unknown { background: #fff4d6; color: #8d4b00; }
+        .muted { color: #7b8794; }
+        .filters a { margin-right: 12px; color: #1d4e89; }
+        .reason { min-width: 220px; line-height: 1.45; }
+        .reason div { margin: 0; }
+        .note { font-size: 12px; color: #52606d; margin-top: 8px; }
+        .retry-btn { margin-top: 6px; font-size: 12px; padding: 2px 8px; cursor: pointer; }
+        .retry-btn:disabled { opacity: 0.6; cursor: default; }
+        .row-result { margin-top: 6px; font-size: 12px; line-height: 1.45; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>处理状态</h1>
+    <a href="{{ url_for('index') }}">返回配置</a>
+</header>
+<main>
+    <section>
+        <h2>系统状态</h2>
+        <div class="grid">
+            <div>
+                <div class="label">Bot</div>
+                <div class="value">{{ status.runtime.runtime_state or "未记录" }}</div>
+            </div>
+            <div>
+                <div class="label">正在接收工作</div>
+                <div class="value">{{ "是" if status.runtime.is_accepting_work else "否" }}</div>
+            </div>
+            <div>
+                <div class="label">Bot PID</div>
+                <div class="value">{{ status.runtime.bot_pid if status.runtime.bot_pid is not none else "—" }}</div>
+            </div>
+            <div>
+                <div class="label">WeChat</div>
+                <div class="value">
+                    {% if status.runtime.wechat_connected is sameas true %}已连接
+                    {% elif status.runtime.wechat_connected is sameas false %}未连接
+                    {% else %}未记录{% endif %}
+                </div>
+            </div>
+            <div>
+                <div class="label">监听数</div>
+                <div class="value">{{ status.runtime.listen_count if status.runtime.listen_count is not none else "未写入 status.json" }}</div>
+            </div>
+            <div>
+                <div class="label">Topic Engine</div>
+                <div class="value">{{ "已启用" if status.engines.topic_enabled else "已关闭" }}</div>
+            </div>
+            <div>
+                <div class="label">Task Engine</div>
+                <div class="value">{{ "已启用" if status.engines.task_enabled else "已关闭" }}</div>
+            </div>
+            <div>
+                <div class="label">Decision Engine</div>
+                <div class="value">{{ "已启用" if status.engines.decision_enabled else "已关闭" }}</div>
+            </div>
+            <div>
+                <div class="label">Risk Engine</div>
+                <div class="value">{{ "已启用" if status.engines.risk_enabled else "已关闭" }}</div>
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <h2>{{ "最近消息" if show_all else "需要关注" }}</h2>
+        <div class="filters">
+            <a href="{{ url_for('operations_home') }}">需要关注</a>
+            <a href="{{ url_for('operations_home', attention=0) }}">最近消息</a>
+        </div>
+        <div class="table-wrap">
+        <table>
+            <thead>
+            <tr>
+                <th>时间</th>
+                <th>消息</th>
+                <th>Topic</th>
+                <th>Task</th>
+                <th>Decision</th>
+                <th>Risk</th>
+                <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for row in rows %}
+            <tr data-message-id="{{ row.message.id }}" data-conversation-id="{{ row.message.conversation_id }}" data-preview="{{ row.message.content_preview }}">
+                <td>{{ row.message.created_at or "—" }}</td>
+                <td>
+                    <div>{{ row.message.content_preview or "—" }}</div>
+                    <div class="muted">{{ row.message.id }}</div>
+                    <div><a href="{{ url_for('operations_message_detail', message_id=row.message.id, conversation_id=row.message.conversation_id) }}">查看详情</a></div>
+                    <div class="row-result"></div>
+                </td>
+                {% for key in ("topic", "task", "decision", "risk") %}
+                <td data-engine="{{ key }}">
+                    {% set view = row[key] %}
+                    <span class="tag {% if view.state == 'SUCCESS' %}tag-success{% elif view.state == 'FAILED_RETRYABLE' %}tag-failed{% else %}tag-unknown{% endif %}">
+                        {{ view.state_label }}
+                    </span>
+                    {% if view.decision %}
+                    <div class="muted">{{ view.decision }}</div>
+                    {% endif %}
+                    {% if view.state == 'FAILED_RETRYABLE' and view.retryable %}
+                    <button type="button" class="retry-btn" data-engine="{{ key }}" data-version="{{ view.version }}">重试</button>
+                    {% endif %}
+                </td>
+                {% endfor %}
+                <td class="reason">
+                    {% for key in ("topic", "task", "decision", "risk") %}
+                        {% set view = row[key] %}
+                        {% if view.state != 'SUCCESS' %}
+                            <div>{{ key }}：{{ view.state_label }}</div>
+                            {% if view.error %}<div>{{ view.error }}</div>{% endif %}
+                            {% for line in view.notice %}<div>{{ line }}</div>{% endfor %}
+                        {% endif %}
+                    {% endfor %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="muted">当前没有需要展示的消息。</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        <p class="note">处理状态未知表示 processing 记录不存在，不能据此判断从未执行，这种状态没有重试按钮。只有「处理失败，可重试」可以单条人工重试。没有批量重试。沿用现有 WebUI 登录边界，没有单独的角色权限。</p>
+    </section>
+</main>
+<script>
+(function () {
+    var names = {topic: "Topic", task: "Task", decision: "Decision", risk: "Risk"};
+
+    function confirmText(engine, preview) {
+        var name = names[engine] || engine;
+        if (engine === "topic") {
+            return "确认重新执行「Topic」处理？\n\n消息：" + preview + "\n当前状态：处理失败\nTopic 重试成功后可能按现有规则再次触发 Task / Decision / Risk。";
+        }
+        return "确认重新执行「" + name + "」处理？\n\n消息：" + preview + "\n当前状态：处理失败\n本操作只会重新执行 " + name + "，不会重新执行 Topic，也不会触发另外两路。";
+    }
+
+    function tagClass(state) {
+        if (state === "SUCCESS") return "tag tag-success";
+        if (state === "FAILED_RETRYABLE") return "tag tag-failed";
+        return "tag tag-unknown";
+    }
+
+    function fillCell(cell, view) {
+        cell.textContent = "";
+        var tag = document.createElement("span");
+        tag.className = tagClass(view.state);
+        tag.textContent = view.state_label || view.state || "";
+        cell.appendChild(tag);
+        if (view.decision) {
+            var decision = document.createElement("div");
+            decision.className = "muted";
+            decision.textContent = view.decision;
+            cell.appendChild(decision);
+        }
+        if (view.state === "FAILED_RETRYABLE" && view.retryable) {
+            var button = document.createElement("button");
+            button.type = "button";
+            button.className = "retry-btn";
+            button.textContent = "重试";
+            button.setAttribute("data-engine", view.engine || cell.getAttribute("data-engine") || "");
+            button.setAttribute("data-version", String(view.version));
+            cell.appendChild(button);
+        }
+    }
+
+    function fillReason(cell, row) {
+        cell.textContent = "";
+        ["topic", "task", "decision", "risk"].forEach(function (key) {
+            var view = row[key];
+            if (!view || view.state === "SUCCESS") return;
+            var line = document.createElement("div");
+            line.textContent = key + "：" + (view.state_label || view.state || "");
+            cell.appendChild(line);
+            if (view.error) {
+                var err = document.createElement("div");
+                err.textContent = view.error;
+                cell.appendChild(err);
+            }
+            (view.notice || []).forEach(function (note) {
+                var noteLine = document.createElement("div");
+                noteLine.textContent = note;
+                cell.appendChild(noteLine);
+            });
+        });
+    }
+
+    function showResult(row, text) {
+        var slot = row.querySelector(".row-result");
+        if (!slot) return;
+        slot.textContent = text || "";
+    }
+
+    function resultText(body) {
+        var after = body.after_state || {};
+        if (body.executed && after.state === "SUCCESS") {
+            return "重试完成" + (after.decision ? "：" + after.decision : "");
+        }
+        if (body.executed) {
+            return "重试仍失败" + (body.error ? "：" + body.error : "");
+        }
+        if (body.error_code === "NOT_FOUND_UNKNOWN") {
+            return "处理状态未知，禁止自动重试，请人工检查。";
+        }
+        if (body.error_code === "STOPPED") {
+            return body.error || "当前未在接收工作，无法重试";
+        }
+        if (body.error_code === "ENGINE_DISABLED") {
+            return body.error || "该处理未启用，无法重试";
+        }
+        if (body.error_code === "AUTH_REQUIRED") {
+            return body.error || "当前未开启登录保护，不能执行人工重试。";
+        }
+        return body.error || "当前状态已变化，无法重试";
+    }
+
+    function refreshRow(row) {
+        var messageId = row.getAttribute("data-message-id");
+        var conversationId = row.getAttribute("data-conversation-id");
+        var url = "/api/operations/messages/" + encodeURIComponent(messageId) + "?conversation_id=" + encodeURIComponent(conversationId);
+        return fetch(url).then(function (response) {
+            return response.json().then(function (body) {
+                if (!response.ok) return;
+                ["topic", "task", "decision", "risk"].forEach(function (key) {
+                    var cell = row.querySelector('td[data-engine="' + key + '"]');
+                    if (cell && body[key]) fillCell(cell, body[key]);
+                });
+                var reason = row.querySelector("td.reason");
+                if (reason) fillReason(reason, body);
+            });
+        });
+    }
+
+    function onRetry(button) {
+        if (button.getAttribute("data-busy") === "1" || button.disabled) return;
+        var row = button.closest("tr");
+        var engine = button.getAttribute("data-engine");
+        var version = button.getAttribute("data-version");
+        var preview = row.getAttribute("data-preview") || "";
+        button.setAttribute("data-busy", "1");
+        if (!window.confirm(confirmText(engine, preview))) {
+            button.removeAttribute("data-busy");
+            return;
+        }
+        button.disabled = true;
+        button.textContent = "正在重试…";
+        var messageId = row.getAttribute("data-message-id");
+        var conversationId = row.getAttribute("data-conversation-id");
+        fetch("/api/operations/messages/" + encodeURIComponent(messageId) + "/retry", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                conversation_id: conversationId,
+                engine: engine,
+                version: Number(version)
+            })
+        }).then(function (response) {
+            return response.json().then(function (body) {
+                showResult(row, resultText(body || {}));
+                return refreshRow(row);
+            });
+        }).catch(function () {
+            showResult(row, "重试请求没有完成");
+            button.disabled = false;
+            button.textContent = "重试";
+            button.removeAttribute("data-busy");
+        });
+    }
+
+    var table = document.querySelector("table");
+    if (!table) return;
+    table.addEventListener("click", function (event) {
+        var button = event.target.closest ? event.target.closest(".retry-btn") : null;
+        if (!button) return;
+        onRetry(button);
+    });
+})();
+</script>
+</body>
+</html>

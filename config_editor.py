@@ -20,11 +20,13 @@
 # ***********************************************************************
 
 from flask import Flask, render_template, request, redirect, url_for, jsonify, session, Response, send_file
+import sys
 import re
 import ast
 import os
 import subprocess
 import psutil
+import signal
 import openai
 import tempfile
 import shutil
@@ -43,60 +45,41 @@ import base64
 import mimetypes
 from datetime import datetime
 import zipfile
+from bot_runtime import (
+    trigger_emergency_stop,
+    trigger_graceful_stop,
+    clear_emergency_stop,
+    clear_stop_request,
+    emergency_stop_requested,
+    read_status_file,
+    read_event_logs,
+    mask_secrets,
+)
+from webui_bot_process import (
+    bot_creationflags,
+    ignore_sigbreak_in_webui,
+    inspect_bot_process,
+    log_spawn_pids,
+    send_ctrl_break_isolated,
+    start_bot_preflight,
+    status_pid,
+    webui_pid,
+)
+from app_config import (
+    load_config as load_structured_config,
+    save_config as save_structured_config,
+    validate_config as validate_structured_config,
+    get_default_config as structured_default_config,
+    verify_webui_password,
+    LOCAL_CONFIG_PATH,
+)
+from capabilities import evaluate_capabilities
+from audit import log_audit, read_audit
+from store_io import atomic_write_json, atomic_write_text, read_json
 
 app = Flask(__name__)
-
-# ===== 统一的论坛数据目录 =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FORUM_DATA_DIR = os.path.join(BASE_DIR, 'forum_data')
-FORUM_AVATAR_DIR = os.path.join(FORUM_DATA_DIR, 'avatar')
-
-def _ensure_forum_dir_exists():
-    try:
-        os.makedirs(FORUM_DATA_DIR, exist_ok=True)
-        os.makedirs(FORUM_AVATAR_DIR, exist_ok=True)
-    except Exception as e:
-        try:
-            app.logger.error(f"创建论坛数据目录失败: {e}")
-        except Exception:
-            pass
-
-
-def _npc_config_file_path():
-    _ensure_forum_dir_exists()
-    return os.path.join(FORUM_DATA_DIR, 'npc_config.json')
-
-# ===== 头像文件处理函数 =====
-def get_prompt_filename_by_character(character_name):
-    """根据角色名获取对应的prompt文件名"""
-    # 在论坛系统中，character_name就是prompt文件名
-    # 因为LISTEN_LIST的结构是[微信名, prompt文件名]，
-    # 而character_name就是从LISTEN_LIST[1]（即prompt文件名）获取的
-    return character_name
-
-def get_avatar_filename(character_name, file_extension):
-    """生成头像文件名"""
-    prompt_filename = get_prompt_filename_by_character(character_name)
-    safe_filename = secure_filename(f"{prompt_filename}_avatar")
-    return f"{safe_filename}.{file_extension}"
-
-def allowed_avatar_file(filename):
-    """检查文件是否为允许的图片格式"""
-    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def get_avatar_file_path(character_name):
-    """获取头像文件路径"""
-    _ensure_forum_dir_exists()
-    prompt_filename = get_prompt_filename_by_character(character_name)
-    safe_filename = secure_filename(f"{prompt_filename}_avatar")
-    
-    # 查找现有的头像文件
-    for ext in ['png', 'jpg', 'jpeg', 'gif', 'webp']:
-        filepath = os.path.join(FORUM_AVATAR_DIR, f"{safe_filename}.{ext}")
-        if os.path.exists(filepath):
-            return filepath
-    return None
 
 def hide_api_key(api_key):
     """
@@ -113,6 +96,110 @@ def is_hidden_api_key(api_key):
     检查API Key是否是隐藏版本
     """
     return api_key and '*' in api_key
+
+def _json_error(error_code, message, detail='', status=400, **extra):
+    payload = {
+        'ok': False,
+        'error': error_code,
+        'message': message,
+        'detail': detail or message,
+    }
+    payload.update({k: v for k, v in extra.items() if v is not None})
+    return jsonify(payload), status
+
+def listen_list_from_form(nicknames, prompt_files, conversation_ids=None, enabled_flags=None):
+    """校验并解析监听对象表单。不完整行返回 (None, error_dict)，不再静默跳过。
+
+    成功时返回结构化行列表。兼容旧调用方：每行含 listen_row=[nickname, prompt]。
+    """
+    nicknames = list(nicknames or [])
+    prompt_files = list(prompt_files or [])
+    conversation_ids = list(conversation_ids or [])
+    enabled_flags = list(enabled_flags or [])
+    if len(nicknames) != len(prompt_files):
+        return None, {
+            'error': 'VALIDATION_ERROR',
+            'message': '监听对象名称与 Prompt 数量不一致',
+            'detail': f'nickname={len(nicknames)} prompt_file={len(prompt_files)}',
+        }
+    result = []
+    seen_names = {}
+    for index, (nick, prompt) in enumerate(zip(nicknames, prompt_files), start=1):
+        nick_stripped = (nick or '').strip()
+        prompt_stripped = (prompt or '').strip()
+        if not nick_stripped:
+            return None, {
+                'error': 'VALIDATION_ERROR',
+                'message': f'第 {index} 个监听对象未填写监听对象名称',
+                'detail': f'row={index} field=nickname',
+                'row': index,
+                'field': 'nickname',
+            }
+        if not prompt_stripped:
+            return None, {
+                'error': 'VALIDATION_ERROR',
+                'message': f'监听对象「{nick_stripped}」尚未选择 Prompt',
+                'detail': f'row={index} field=prompt_file',
+                'row': index,
+                'field': 'prompt_file',
+            }
+        if nick_stripped in seen_names:
+            return None, {
+                'error': 'VALIDATION_ERROR',
+                'message': '存在重复监听对象名称。',
+                'detail': f'display_name={nick_stripped} row={index}',
+                'row': index,
+                'field': 'nickname',
+            }
+        seen_names[nick_stripped] = index
+        conv_id = ''
+        if index <= len(conversation_ids):
+            conv_id = (conversation_ids[index - 1] or '').strip()
+        enabled = True
+        if index <= len(enabled_flags):
+            flag = str(enabled_flags[index - 1] or '').strip().lower()
+            enabled = flag not in ('0', 'false', 'off', 'no', '')
+        result.append({
+            'id': conv_id,
+            'display_name': nick_stripped,
+            'prompt_name': prompt_stripped,
+            'enabled': enabled,
+            'listen_row': [nick_stripped, prompt_stripped],
+        })
+    return result, None
+
+
+def listen_rows_as_listen_list(rows):
+    return [item['listen_row'] if isinstance(item, dict) else item for item in (rows or [])]
+
+
+def ui_listen_rows(config):
+    """监听对象表格行：优先 CONVERSATIONS，否则 LISTEN_LIST。"""
+    from conversation_store import conversations_for_ui, prompt_name_of
+    cfg = config or {}
+    conversations = conversations_for_ui(cfg)
+    agents = cfg.get('AGENT_CONFIGS') or []
+    rows = []
+    for conv in conversations:
+        rows.append({
+            'id': conv.get('id') or '',
+            'display_name': conv.get('display_name') or '',
+            'prompt_name': prompt_name_of(conv, agents),
+            'enabled': bool(conv.get('enabled', True)),
+            'conversation_type': conv.get('conversation_type') or 'UNKNOWN',
+        })
+    if rows:
+        return rows
+    for item in cfg.get('LISTEN_LIST') or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            rows.append({
+                'id': '',
+                'display_name': item[0],
+                'prompt_name': item[1],
+                'enabled': True,
+                'conversation_type': 'UNKNOWN',
+            })
+    return rows
 
 def safe_type_convert(value, target_type, default_value=None, field_name=""):
     """
@@ -162,54 +249,24 @@ def safe_type_convert(value, target_type, default_value=None, field_name=""):
     
     return value
 
-def validate_config_types(config_path):
-    """
-    验证config.py中的数据类型是否正确
-    """
+def validate_config_types(config_path=None):
+    """校验结构化配置的类型与范围。"""
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # 检查是否有字符串形式的数字
-        import re
-        
-        # 查找可能的问题配置项
-        issues = []
-        
-        # 检查应该是整数但被保存为字符串的配置项
-        int_fields = ['MAX_GROUPS', 'MAX_TOKEN', 'QUEUE_WAITING_TIME', 'EMOJI_SENDING_PROBABILITY', 
-                     'MAX_MESSAGE_LOG_ENTRIES', 'MAX_MEMORY_NUMBER', 'PORT', 'ONLINE_API_MAX_TOKEN',
-                     'REQUESTS_TIMEOUT', 'MAX_WEB_CONTENT_LENGTH', 'RESTART_INACTIVITY_MINUTES',
-                     'GROUP_CHAT_RESPONSE_PROBABILITY', 'ASSISTANT_MAX_TOKEN']
-        
-        # 检查应该是浮点数但被保存为字符串的配置项  
-        float_fields = ['TEMPERATURE', 'MOONSHOT_TEMPERATURE', 'MIN_COUNTDOWN_HOURS', 'MAX_COUNTDOWN_HOURS',
-                       'AVERAGE_TYPING_SPEED', 'RANDOM_TYPING_SPEED_MIN', 'RANDOM_TYPING_SPEED_MAX',
-                       'ONLINE_API_TEMPERATURE', 'RESTART_INTERVAL_HOURS', 'ASSISTANT_TEMPERATURE']
-        
-        for field in int_fields:
-            pattern = rf'{field}\s*=\s*[\'"](\d+)[\'"]'
-            matches = re.findall(pattern, content)
-            if matches:
-                issues.append(f"{field} 被保存为字符串 '{matches[0]}'，应为整数 {matches[0]}")
-        
-        for field in float_fields:
-            pattern = rf'{field}\s*=\s*[\'"](\d+\.?\d*)[\'"]'
-            matches = re.findall(pattern, content)
-            if matches:
-                issues.append(f"{field} 被保存为字符串 '{matches[0]}'，应为浮点数 {matches[0]}")
-        
-        if issues:
-            app.logger.warning(f"配置文件类型验证发现问题: {'; '.join(issues)}")
-            return False
-        
+        issues = validate_structured_config(parse_config())
+        for item in issues:
+            if item.get("code") in ("TYPE", "RANGE"):
+                app.logger.warning(item.get("message"))
         return True
-        
     except Exception as e:
-        app.logger.error(f"配置文件类型验证失败: {e}")
+        app.logger.warning(f"配置类型校验失败: {e}")
         return False
 
-app.secret_key = os.urandom(24).hex()  # 48位十六进制字符串
+app.secret_key = load_structured_config().get('FLASK_SECRET_KEY') or os.urandom(24).hex()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=False,
+)
 bot_process = None
 
 # 全局日志队列
@@ -219,8 +276,10 @@ CHAT_CONTEXTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'c
 CHAT_CONTEXTS_LOCK_FILE = CHAT_CONTEXTS_FILE + '.lock'
 
 last_heartbeat_time = 0  # 上次收到心跳的时间戳
-HEARTBEAT_TIMEOUT = 15   # 心跳超时阈值（秒），应大于 bot.py 的 HEARTBEAT_INTERVAL
+last_runtime_snapshot = {}
 current_bot_pid = None
+current_bot_meta = {}
+HEARTBEAT_TIMEOUT = 15   # 心跳超时阈值（秒），应大于 bot.py 的 HEARTBEAT_INTERVAL
 
 def get_chat_context_users():
     """从 chat_contexts.json 读取用户列表 (即顶级键)"""
@@ -242,9 +301,7 @@ def login():
 
     if request.method == 'POST':
         password = request.form.get('password', '')
-        stored_pwd = config.get('LOGIN_PASSWORD', '')
-        
-        if password == stored_pwd:
+        if verify_webui_password(password, config):
             session['logged_in'] = True
             return redirect(url_for('index'))
         else:
@@ -267,9 +324,64 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def _is_path_inside(base_dir, target_path):
+    """确认目标文件仍在允许目录内，防止路径穿越。"""
+    try:
+        base = os.path.normcase(os.path.realpath(base_dir))
+        target = os.path.normcase(os.path.realpath(target_path))
+        return os.path.commonpath([base, target]) == base
+    except (ValueError, OSError):
+        return False
+
+def _safe_file_path(base_dir, filename):
+    """将用户传入的文件名限制在 base_dir 内。"""
+    if not filename or not isinstance(filename, str):
+        return None
+    if os.path.isabs(filename):
+        return None
+    normalized = filename.replace('\\', '/').lstrip('/')
+    if '..' in normalized.split('/'):
+        return None
+    candidate = os.path.join(os.path.realpath(base_dir), os.path.basename(normalized))
+    if not _is_path_inside(base_dir, candidate):
+        return None
+    return candidate
+
 @app.route('/start_bot', methods=['POST'])
+@login_required
 def start_bot():
-    global bot_process
+    global bot_process, last_runtime_snapshot, last_heartbeat_time, current_bot_pid, current_bot_meta
+    flask_alive = bot_process is not None and bot_process.poll() is None
+    extra_pids = [current_bot_pid]
+    if bot_process and bot_process.pid:
+        extra_pids.append(bot_process.pid)
+    preflight = start_bot_preflight(
+        BASE_DIR,
+        web_pid=webui_pid(),
+        status=read_status_file() or {},
+        extra_pids=extra_pids,
+        flask_bot_alive=flask_alive,
+    )
+    if not preflight.get("allow"):
+        living_pid = preflight.get("pid")
+        if living_pid:
+            current_bot_pid = living_pid
+        app.logger.warning(
+            "拒绝第二次启动 Bot：reason=%s pid=%s WEB_PID=%s",
+            preflight.get("reason"),
+            living_pid,
+            webui_pid(),
+        )
+        msg = "项目已有存活 Bot，拒绝第二次启动"
+        return {
+            "status": "already_running",
+            "error": msg,
+            "message": msg,
+            "reason": preflight.get("reason"),
+            "pid": living_pid,
+            "web_pid": webui_pid(),
+        }, 409
+
     if bot_process is None or bot_process.poll() is not None:
         # 如果目录下存在 user_timers.json 则删除
         user_timers_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_timers.json')
@@ -279,100 +391,321 @@ def start_bot():
             except Exception as e:
                 app.logger.warning(f"重置主动消息定时器失败: {e}")
 
+        clear_emergency_stop()
+        clear_stop_request()
+        last_heartbeat_time = 0
+        last_runtime_snapshot = {'state': 'STARTING', 'updated_at': time.time()}
+
         bot_dir = os.path.dirname(os.path.abspath(__file__))
         
         bot_py = os.path.join(bot_dir, 'bot.py')
         bot_exe = os.path.join(bot_dir, 'bot.exe')
         
         if os.path.exists(bot_py):
-            cmd = ['python', bot_py]
+            app.logger.info(f"使用当前解释器启动机器人: {sys.executable} {bot_py}")
+            cmd = [sys.executable, bot_py]
         elif os.path.exists(bot_exe):
             cmd = [bot_exe]
         else:
             return {'error': 'No bot executable found'}, 404
 
-        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        creation_flags = bot_creationflags()
         bot_process = subprocess.Popen(
             cmd,
             creationflags=creation_flags
         )
-    return {'status': 'started'}, 200
+        current_bot_pid = bot_process.pid
+        current_bot_meta = log_spawn_pids(app.logger, bot_process.pid, web_pid=webui_pid()) or {}
+        log_audit("start_bot", detail="启动机器人")
+        # 等待微信初始化（含窗口恢复重试）。状态文件由 Bot 进程写入，不依赖心跳请求。
+        deadline = time.time() + 18
+        while time.time() < deadline:
+            if bot_process.poll() is not None:
+                msg = (
+                    f'Bot 启动失败，进程已退出 (退出码 {bot_process.returncode})。'
+                    '请确认微信客户端已启动并登录，然后查看 Bot 控制台日志。'
+                )
+                app.logger.error(msg)
+                return {'status': 'failed', 'error': msg, 'message': msg}, 500
+            status = read_status_file() or {}
+            state = str(status.get('state') or '').upper()
+            if state in ('RUNNING', 'DEGRADED'):
+                break
+            if state == 'ERROR':
+                # 等进程真正退出，避免前端先显示启动成功
+                time.sleep(0.2)
+                continue
+            time.sleep(0.25)
+    return {'status': 'started', 'pid': bot_process.pid if bot_process else current_bot_pid}, 200
 
 @app.route('/stop_bot', methods=['POST'])
+@login_required
 def stop_bot():
-    global bot_process, last_heartbeat_time, current_bot_pid
-    # 检查状态时，也考虑 current_bot_pid 是否指示有活跃进程
+    global bot_process, last_heartbeat_time, current_bot_pid, last_runtime_snapshot
+    # 检查状态时，也考虑 status.json pid 是否指向本项目存活 Bot
     is_considered_running = False
     if bot_process and bot_process.poll() is None:
         is_considered_running = True
-    elif (time.time() - last_heartbeat_time) < HEARTBEAT_TIMEOUT and current_bot_pid is not None:
-        try:
-            if psutil.pid_exists(current_bot_pid): # 确保PID对应的进程还存在
-                 is_considered_running = True
-        except Exception: # psutil.pid_exists 可能会抛出异常，例如权限问题
-            pass
+    if _bot_process_alive():
+        is_considered_running = True
 
     if not is_considered_running:
         app.logger.info("尝试停止机器人，但根据进程对象和心跳判断，机器人似乎已停止。")
-        # 即使如此，也调用stop_bot_process来清理状态
-        stop_bot_process(pid_to_kill=current_bot_pid if current_bot_pid else (bot_process.pid if bot_process else None))
-        return {'status': 'stopped'}, 200
-    else:
-        pid_from_flask_process = bot_process.pid if bot_process else None
-        # 优先使用 current_bot_pid，因为它更可能是最新的
-        # 如果 current_bot_pid 和 flask 记录的 pid 不同，且 flask 的 pid 进程也存在，都尝试杀掉
-        pids_to_attempt_kill = set()
-        if current_bot_pid:
-            pids_to_attempt_kill.add(current_bot_pid)
-        if pid_from_flask_process:
-            pids_to_attempt_kill.add(pid_from_flask_process)
+        stop_bot_process(pid_to_kill=_preferred_bot_pid(), force_break=False)
+        last_runtime_snapshot['state'] = 'STOPPED'
+        last_runtime_snapshot['updated_at'] = time.time()
+        return {'status': 'stopped', 'state': 'STOPPED', 'web_pid': webui_pid()}, 200
 
-        app.logger.info(f"准备停止机器人，目标PID(s): {pids_to_attempt_kill}")
+    trigger_graceful_stop(reason='webui_stop')
+    last_runtime_snapshot['state'] = 'STOPPING'
+    last_runtime_snapshot['updated_at'] = time.time()
+
+    deadline = time.time() + 12
+    stopped = False
+    while time.time() < deadline:
+        status = read_status_file() or {}
+        if str(status.get('state') or '').upper() == 'STOPPED':
+            stopped = True
+            break
+        if not _bot_process_alive():
+            stopped = True
+            break
+        time.sleep(0.2)
+
+    if stopped:
+        extra_deadline = time.time() + 5
+        while time.time() < extra_deadline and _bot_process_alive():
+            time.sleep(0.2)
+
+    pids_to_attempt_kill = _candidate_bot_pids()
+    need_force = (not stopped) or _bot_process_alive()
+    if need_force:
+        app.logger.warning(
+            "优雅停止后仍需结束 Bot PID(s): %s stopped=%s",
+            pids_to_attempt_kill,
+            stopped,
+        )
         for pid in pids_to_attempt_kill:
-            stop_bot_process(pid_to_kill=pid) # 传入要杀死的PID
+            stop_bot_process(pid_to_kill=pid, force_break=not stopped)
 
-        # 最终状态由 stop_bot_process 设置 current_bot_pid 和 last_heartbeat_time
-        return {'status': 'stopped'}, 200
+    time.sleep(0.3)
+    log_audit("stop_bot", detail="停止机器人")
+    last_runtime_snapshot['state'] = 'STOPPED'
+    last_runtime_snapshot['updated_at'] = time.time()
+    return {'status': 'stopped', 'state': 'STOPPED', 'web_pid': webui_pid()}, 200
+
+
+def _preferred_bot_pid():
+    if current_bot_pid:
+        return current_bot_pid
+    if bot_process:
+        return bot_process.pid
+    return status_pid(read_status_file() or {})
+
+
+def _candidate_bot_pids():
+    pids = set()
+    if current_bot_pid:
+        pids.add(current_bot_pid)
+    if bot_process and bot_process.pid:
+        pids.add(bot_process.pid)
+    spid = status_pid(read_status_file() or {})
+    if spid:
+        pids.add(spid)
+    web = webui_pid()
+    pids.discard(web)
+    pids.discard(0)
+    pids.discard(None)
+    return pids
+
+
+def _bot_process_alive():
+    """以 status.json pid + cmdline 身份确认，不单凭 bot_process.poll() / pid_exists。"""
+    web = webui_pid()
+    for pid in _candidate_bot_pids():
+        verdict = inspect_bot_process(pid, BASE_DIR, web_pid=web)
+        if verdict.get("ok"):
+            return True
+    return False
     
 @app.route('/bot_status')
+@app.route('/status')
+@login_required
 def bot_status():
+    return jsonify(_build_bot_status())
+
+def _process_is_alive():
     global bot_process, last_heartbeat_time, current_bot_pid
-    
     process_alive_via_flask_obj = bot_process is not None and bot_process.poll() is None
     heartbeat_is_recent = (time.time() - last_heartbeat_time) < HEARTBEAT_TIMEOUT
-    
-    # 新增：检查 current_bot_pid 对应的进程是否实际存活
     process_alive_via_current_pid = False
     if current_bot_pid is not None:
         try:
             if psutil.pid_exists(current_bot_pid):
-                process_alive_via_current_pid = True 
+                process_alive_via_current_pid = True
         except psutil.Error:
             pass
-
-    current_status = "stopped"
-
     if process_alive_via_flask_obj:
-        current_status = "running"
-    elif heartbeat_is_recent and process_alive_via_current_pid: # 优先检查通过PID确认的存活
-        current_status = "running"
-    elif heartbeat_is_recent and not process_alive_via_current_pid and current_bot_pid is not None:
-        app.logger.warning(f"Bot status: Heartbeat recent, but PID {current_bot_pid} does not exist. Marking as stopped for now. Last heartbeat: {time.time() - last_heartbeat_time:.1f}s ago")
-        current_status = "stopped" # 倾向于保守
-    elif heartbeat_is_recent : # 心跳最近，但没有 current_bot_pid 信息 (例如 bot.py 未发送PID)
-        current_status = "running" # 保持原逻辑：心跳最近则认为运行
+        return True
+    if heartbeat_is_recent and process_alive_via_current_pid:
+        return True
+    if heartbeat_is_recent and not process_alive_via_current_pid and current_bot_pid is not None:
+        return False
+    if heartbeat_is_recent:
+        return True
+    return False
 
-    return {"status": current_status}
+def _format_uptime(seconds):
+    seconds = int(seconds or 0)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s"
+
+def _build_bot_status():
+    global last_runtime_snapshot
+    alive = _process_is_alive()
+    file_status = read_status_file()
+    snapshot = dict(last_runtime_snapshot or {})
+    snapshot.update(file_status or {})
+    if emergency_stop_requested() and not alive:
+        state = 'STOPPED'
+    elif not alive:
+        state = snapshot.get('state') if snapshot.get('state') in ('ERROR', 'STOPPED') else 'STOPPED'
+    else:
+        state = snapshot.get('state') or 'RUNNING'
+    if state == 'STOPPED':
+        current_status = 'stopped'
+    elif state == 'STOPPING':
+        current_status = 'stopping'
+    elif alive:
+        current_status = 'running'
+    else:
+        current_status = 'stopped'
+    try:
+        cfg = parse_config()
+        listen_count = len(cfg.get('LISTEN_LIST') or [])
+        model_name = cfg.get('MODEL') or ''
+        key = str(cfg.get('DEEPSEEK_API_KEY') or '').strip()
+        api_configured = bool(key) and key not in ('YOUR_API_KEY', 'YOUR_API_KEY_HERE', 'YOUR_PASSWORD')
+    except Exception:
+        cfg = {}
+        listen_count = 0
+        model_name = ''
+        api_configured = False
+    ai_status = snapshot.get('ai') or ('ok' if api_configured else 'error')
+    wechat_status = snapshot.get('wechat') or ('connected' if alive else 'disconnected')
+    return {
+        'status': current_status,
+        'state': state,
+        'alive': alive,
+        'emergency': bool(snapshot.get('emergency') or emergency_stop_requested()),
+        'wechat': wechat_status,
+        'ai': ai_status,
+        'ai_detail': snapshot.get('ai_detail') or ('已配置' if api_configured else '未配置'),
+        'model': model_name,
+        'listen_count': listen_count,
+        'uptime_seconds': snapshot.get('uptime_seconds') if alive else 0,
+        'uptime_text': _format_uptime(snapshot.get('uptime_seconds') if alive else 0),
+        'today_received': snapshot.get('today_received') or 0,
+        'today_replied': snapshot.get('today_replied') or 0,
+        'today_errors': snapshot.get('today_errors') or 0,
+        'today_llm_calls': snapshot.get('today_llm_calls') or 0,
+        'today_llm_main': snapshot.get('today_llm_main') or 0,
+        'today_llm_failed': snapshot.get('today_llm_failed') or 0,
+        'send_queue_pending': snapshot.get('send_queue_pending') or 0,
+        'degraded_reasons': snapshot.get('degraded_reasons') or [],
+        'capabilities': evaluate_capabilities(cfg, snapshot).get('_list') or [],
+        'recent_chats': snapshot.get('recent_chats') or [],
+        'recent_errors': snapshot.get('recent_errors') or [],
+        'recent_llm': snapshot.get('recent_llm') or [],
+        'recent_audit': read_audit(limit=20),
+        'pid': current_bot_pid,
+        'web_pid': webui_pid(),
+    }
+
+@app.route('/emergency_stop', methods=['POST'])
+@login_required
+def emergency_stop():
+    """独立于 Bot 消息线程的紧急停止：先写标志文件，再终止进程。"""
+    global last_runtime_snapshot
+    trigger_emergency_stop(reason='webui_emergency_stop')
+    log_audit("emergency_stop", detail="紧急停止")
+    last_runtime_snapshot = {
+        'state': 'STOPPING',
+        'emergency': True,
+        'updated_at': time.time(),
+    }
+    time.sleep(0.2)
+    stop_bot()
+    last_runtime_snapshot = {
+        'state': 'STOPPED',
+        'emergency': True,
+        'updated_at': time.time(),
+    }
+    return jsonify({'status': 'emergency_stopped', 'state': 'STOPPED'}), 200
+
+@app.route('/restart_bot', methods=['POST'])
+@login_required
+def restart_bot():
+    stop_bot()
+    time.sleep(0.5)
+    return start_bot()
+
+@app.route('/api/runtime/overview')
+@login_required
+def runtime_overview():
+    return jsonify(_build_bot_status())
+
+@app.route('/api/runtime/logs')
+@login_required
+def runtime_event_logs():
+    category = request.args.get('category', '').strip()
+    limit = request.args.get('limit', 200, type=int)
+    return jsonify({'logs': read_event_logs(limit=limit, category=category)})
+
+@app.route('/api/runtime/audit')
+@login_required
+def runtime_audit_logs():
+    limit = request.args.get('limit', 100, type=int)
+    return jsonify({'audit': read_audit(limit=limit)})
+
+@app.route('/api/test_ai_connection', methods=['POST'])
+@login_required
+def test_ai_connection():
+    try:
+        cfg = parse_config()
+        api_key = cfg.get('DEEPSEEK_API_KEY') or ''
+        if not api_key or api_key in ('YOUR_API_KEY', 'YOUR_API_KEY_HERE') or '*' in str(api_key):
+            return jsonify({'ok': False, 'message': '主模型 API Key 未配置'}), 400
+        import openai
+        client = openai.OpenAI(api_key=api_key, base_url=cfg.get('DEEPSEEK_BASE_URL'))
+        started = time.time()
+        client.models.list()
+        elapsed = time.time() - started
+        return jsonify({
+            'ok': True,
+            'message': f'连接成功，耗时 {elapsed:.2f}s',
+            'model': cfg.get('MODEL') or '',
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'message': mask_secrets(str(e))}), 400
 
 @app.route('/submit_config', methods=['POST'])
 @login_required
 def submit_config():
     global bot_process
     if bot_process and bot_process.poll() is None:
-        return jsonify({'error': '程序正在运行，请先停止再保存配置'}), 400
+        return _json_error(
+            'BOT_RUNNING',
+            '程序正在运行，请先停止再保存配置',
+            'bot_process is alive',
+            status=400,
+        )
     try:
         if not request.form:
-            return jsonify({'error': '空的表单提交'}), 400
+            return _json_error('EMPTY_FORM', '空的表单提交', status=400)
         
         current_config_before_update = parse_config()
         old_listen_list_map = {item[0]: item[1] for item in current_config_before_update.get('LISTEN_LIST', [])}
@@ -393,15 +726,48 @@ def submit_config():
 
         nicknames_from_form = request.form.getlist('nickname')
         prompt_files_from_form = request.form.getlist('prompt_file')
-        
-        processed_listen_list = []
-        if nicknames_from_form and prompt_files_from_form and len(nicknames_from_form) == len(prompt_files_from_form):
-            for nick, pf in zip(nicknames_from_form, prompt_files_from_form):
-                nick_stripped = nick.strip()
-                pf_stripped = pf.strip()
-                if nick_stripped and pf_stripped: 
-                    processed_listen_list.append([nick_stripped, pf_stripped])
+        conversation_ids_from_form = request.form.getlist('conversation_id')
+        enabled_from_form = request.form.getlist('listen_enabled')
+        processed_listen_rows, listen_error = listen_list_from_form(
+            nicknames_from_form,
+            prompt_files_from_form,
+            conversation_ids_from_form,
+            enabled_from_form,
+        )
+        if listen_error:
+            return _json_error(
+                listen_error['error'],
+                listen_error['message'],
+                listen_error.get('detail', ''),
+                status=400,
+                row=listen_error.get('row'),
+                field=listen_error.get('field'),
+            )
+        from conversation_store import (
+            ConversationValidationError,
+            apply_listen_rows,
+            project_listen_list,
+        )
+        from agent_store import ensure_agents_for_conversations
+        try:
+            conversations = apply_listen_rows(current_config_before_update, processed_listen_rows)
+        except ConversationValidationError as conv_err:
+            return _json_error(
+                conv_err.code,
+                conv_err.message,
+                conv_err.detail,
+                status=400,
+                **(conv_err.extra or {}),
+            )
+        agents = ensure_agents_for_conversations(
+            conversations,
+            current_config_before_update.get('AGENT_CONFIGS') or [],
+            prompt_root=BASE_DIR,
+        )
+        processed_listen_list = project_listen_list(conversations, agents)
         new_values_for_config_py['LISTEN_LIST'] = processed_listen_list
+        new_values_for_config_py['CONVERSATIONS'] = conversations
+        new_values_for_config_py['AGENT_CONFIGS'] = agents
         
         new_listen_list_map = {item[0]: item[1] for item in processed_listen_list}
         
@@ -425,7 +791,7 @@ def submit_config():
             new_values_for_config_py[field] = field in request.form
 
         for key_from_form in request.form:
-            if key_from_form in ['nickname', 'prompt_file'] or key_from_form in boolean_fields or key_from_form in api_key_fields:
+            if key_from_form in ['nickname', 'prompt_file', 'conversation_id', 'listen_enabled'] or key_from_form in boolean_fields or key_from_form in api_key_fields:
                 continue 
 
             value_from_form = request.form[key_from_form].strip()
@@ -554,11 +920,7 @@ def submit_config():
                     new_values_for_config_py[key_from_form] = value_from_form
         
         update_config(new_values_for_config_py)
-        
-        # 验证配置文件类型正确性
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, 'config.py')
-        validate_config_types(config_path)
+        validate_config_types()
 
         if users_whose_prompt_changed:
             with FileLock(CHAT_CONTEXTS_LOCK_FILE):
@@ -579,47 +941,100 @@ def submit_config():
                 except (json.JSONDecodeError, IOError) as e:
                     app.logger.error(f"清除因Prompt变更导致的聊天上下文时出错: {e}")
                     
-        return '', 204 
+        log_audit("save_config", detail=f"已保存配置，监听对象 {len(processed_listen_list)} 个")
+        return jsonify({'ok': True, 'message': '配置保存成功'}), 200
     except Exception as e:
         app.logger.error(f"配置保存失败: {str(e)}")
-        return jsonify({'error': f'配置保存失败: {str(e)}'}), 500
+        return _json_error(
+            'CONFIG_WRITE_FAILED',
+            '无法写入配置文件',
+            str(e),
+            status=500,
+        )
 
-def stop_bot_process(pid_to_kill=None):
-    global bot_process, last_heartbeat_time, current_bot_pid
+def stop_bot_process(pid_to_kill=None, force_break=True):
+    global bot_process, last_heartbeat_time, current_bot_pid, current_bot_meta
     
     process_killed_successfully = False
+    web_pid = webui_pid()
 
     if pid_to_kill:
-        try:
-            if psutil.pid_exists(pid_to_kill):
-                bot_psutil = psutil.Process(pid_to_kill)
-                app.logger.info(f"尝试终止PID为 {pid_to_kill} 的机器人进程...")
-                bot_psutil.terminate()
-                bot_psutil.wait(timeout=5) # 等待进程终止
-                app.logger.info(f"通过 terminate 成功停止了PID {pid_to_kill}。")
+        verdict = inspect_bot_process(
+            pid_to_kill,
+            BASE_DIR,
+            web_pid=web_pid,
+            expected_create_time=(current_bot_meta or {}).get("create_time"),
+        )
+        if not verdict.get("ok"):
+            app.logger.warning(
+                "拒绝停止 PID %s：%s。WEB_PID=%s 保持不变。",
+                pid_to_kill,
+                verdict.get("reason"),
+                web_pid,
+            )
+            if verdict.get("reason") in ("pid_not_running", "empty_pid", "invalid_pid", "non_positive_pid"):
                 process_killed_successfully = True
             else:
-                app.logger.info(f"PID {pid_to_kill} 指定的进程不存在。")
-                process_killed_successfully = True # 认为已停止
-        except psutil.NoSuchProcess:
-            app.logger.info(f"尝试终止PID {pid_to_kill} 时，进程已不存在。")
-            process_killed_successfully = True # 认为已停止
-        except psutil.TimeoutExpired: # psutil.TimeoutExpired
-            app.logger.warning(f"Terminate PID {pid_to_kill} 超时，尝试 kill。")
+                last_heartbeat_time = 0
+                return
+        else:
             try:
-                if psutil.pid_exists(pid_to_kill): # 再次确认存在
-                    bot_psutil_kill = psutil.Process(pid_to_kill)
-                    bot_psutil_kill.kill()
-                    bot_psutil_kill.wait(timeout=3)
-                    app.logger.info(f"通过 kill 成功停止了PID {pid_to_kill}。")
+                bot_psutil = psutil.Process(pid_to_kill)
+                app.logger.info(
+                    "尝试终止机器人进程 PID=%s WEB_PID=%s cmdline=%s",
+                    pid_to_kill,
+                    web_pid,
+                    (verdict.get("info") or {}).get("cmdline_text"),
+                )
+                sent_break = False
+                if force_break and os.name == "nt":
+                    try:
+                        sent_break = send_ctrl_break_isolated(pid_to_kill)
+                        if sent_break:
+                            app.logger.info(
+                                "已向 Bot process group PID %s 发送 CTRL_BREAK（WebUI PID %s 不在目标组）。",
+                                pid_to_kill,
+                                web_pid,
+                            )
+                    except Exception as break_err:
+                        app.logger.warning(f"发送 CTRL_BREAK 失败，将直接结束进程: {break_err}")
+                try:
+                    bot_psutil.wait(timeout=8 if sent_break else 2)
+                    app.logger.info(f"PID {pid_to_kill} 已自行退出。")
+                    process_killed_successfully = True
+                except psutil.TimeoutExpired:
+                    app.logger.warning(f"等待 PID {pid_to_kill} 退出超时，尝试 terminate。")
+                    bot_psutil.terminate()
+                    bot_psutil.wait(timeout=5)
+                    app.logger.info(f"通过 terminate 成功停止了PID {pid_to_kill}。")
                     process_killed_successfully = True
             except psutil.NoSuchProcess:
-                 app.logger.info(f"尝试 kill PID {pid_to_kill} 时，进程已不存在。")
-                 process_killed_successfully = True
-            except Exception as e_kill:
-                app.logger.error(f"Kill PID {pid_to_kill} 失败: {e_kill}")
-        except Exception as e:
-            app.logger.error(f"停止PID {pid_to_kill} 时发生错误: {e}")
+                app.logger.info(f"尝试终止PID {pid_to_kill} 时，进程已不存在。")
+                process_killed_successfully = True
+            except psutil.TimeoutExpired:
+                app.logger.warning(f"Terminate PID {pid_to_kill} 超时，尝试 kill。")
+                try:
+                    if psutil.pid_exists(pid_to_kill):
+                        still = inspect_bot_process(pid_to_kill, BASE_DIR, web_pid=web_pid)
+                        if not still.get("ok"):
+                            app.logger.warning(
+                                "kill 前再次校验失败 PID %s：%s，放弃。",
+                                pid_to_kill,
+                                still.get("reason"),
+                            )
+                        else:
+                            bot_psutil_kill = psutil.Process(pid_to_kill)
+                            bot_psutil_kill.kill()
+                            bot_psutil_kill.wait(timeout=3)
+                            app.logger.info(f"通过 kill 成功停止了PID {pid_to_kill}。")
+                            process_killed_successfully = True
+                except psutil.NoSuchProcess:
+                    app.logger.info(f"尝试 kill PID {pid_to_kill} 时，进程已不存在。")
+                    process_killed_successfully = True
+                except Exception as e_kill:
+                    app.logger.error(f"Kill PID {pid_to_kill} 失败: {e_kill}")
+            except Exception as e:
+                app.logger.error(f"停止PID {pid_to_kill} 时发生错误: {e}")
 
     # 如果被杀死的PID是Flask自己启动的进程，则清空bot_process
     if bot_process and pid_to_kill == bot_process.pid and process_killed_successfully:
@@ -630,6 +1045,7 @@ def stop_bot_process(pid_to_kill=None):
     if current_bot_pid and pid_to_kill == current_bot_pid and process_killed_successfully:
         app.logger.info(f"清空 current_bot_pid (原PID: {current_bot_pid})。")
         current_bot_pid = None
+        current_bot_meta = {}
 
     last_heartbeat_time = 0
     if not current_bot_pid and not bot_process: # 确保如果所有已知进程句柄都清了，才彻底标记
@@ -639,7 +1055,7 @@ def stop_bot_process(pid_to_kill=None):
 
 @app.route('/bot_heartbeat', methods=['POST'])
 def bot_heartbeat():
-    global last_heartbeat_time, current_bot_pid
+    global last_heartbeat_time, current_bot_pid, last_runtime_snapshot, current_bot_meta
     try:
         last_heartbeat_time = time.time()
         data = request.get_json()
@@ -647,13 +1063,30 @@ def bot_heartbeat():
         if data and 'pid' in data:
             received_pid = data.get('pid')
             if received_pid and isinstance(received_pid, int):
-                if current_bot_pid != received_pid:
-                    app.logger.info(f"Bot PID updated via heartbeat: old={current_bot_pid}, new={received_pid}")
-                    current_bot_pid = received_pid
+                verdict = inspect_bot_process(received_pid, BASE_DIR, web_pid=webui_pid())
+                if not verdict.get("ok"):
+                    app.logger.warning(
+                        "Ignored heartbeat PID %s: %s (WEB_PID=%s)",
+                        received_pid,
+                        verdict.get("reason"),
+                        webui_pid(),
+                    )
+                else:
+                    info = verdict.get("info") or {}
+                    if current_bot_pid != received_pid:
+                        app.logger.info(f"Bot PID updated via heartbeat: old={current_bot_pid}, new={received_pid}")
+                        current_bot_pid = received_pid
+                    current_bot_meta = {
+                        "WEB_PID": webui_pid(),
+                        "BOT_PID": received_pid,
+                        "BOT_PPID": info.get("ppid"),
+                        "create_time": info.get("create_time"),
+                        "cmdline": info.get("cmdline_text"),
+                    }
             else:
                 app.logger.warning(f"Received heartbeat with invalid PID: {received_pid}")
-        else:
-            app.logger.debug("Received heartbeat without PID information.")
+        if data and isinstance(data.get('runtime'), dict):
+            last_runtime_snapshot = data['runtime']
 
         return jsonify({'status': 'heartbeat_received'}), 200
     except Exception as e:
@@ -662,77 +1095,11 @@ def bot_heartbeat():
         return jsonify({'error': 'Failed to process heartbeat'}), 500
 
 def parse_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, 'config.py')
-    config = {}
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('#') or not line:
-                    continue
-                match = re.match(r'^(\w+)\s*=\s*(.+)$', line)
-                if match:
-                    var_name = match.group(1)
-                    var_value_str = match.group(2)
-                    try:
-                        var_value = ast.literal_eval(var_value_str)
-                        config[var_name] = var_value
-                    except:
-                        config[var_name] = var_value_str
-        return config
-    except FileNotFoundError:
-        raise Exception(f"配置文件不存在于: {config_path}")
+    return load_structured_config()
 
 def update_config(new_values):
-    """
-    更新配置文件内容，确保文件写入安全性和原子性，避免文件被清空或损坏。
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, 'config.py')
-    lock_path = config_path + '.lock'  # 文件锁路径
-
-    # 使用文件锁，确保只有一个进程/线程能操作 config.py
-    with FileLock(lock_path):
-        try:
-            # 读取现有配置文件内容
-            with open(config_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            new_lines = []
-            for line in lines:
-                line_stripped = line.strip()
-                # 保留注释或空行
-                if line_stripped.startswith('#') or not line_stripped:
-                    new_lines.append(line)
-                    continue
-
-                # 匹配配置项的键值对
-                match = re.match(r'^\s*(\w+)\s*=.*', line)
-                if match:
-                    var_name = match.group(1)
-                    # 如果新配置中包含此变量，更新其值
-                    if var_name in new_values:
-                        value = new_values[var_name]
-                        new_line = f"{var_name} = {repr(value)}\n"
-                        new_lines.append(new_line)
-                    else:
-                        # 保留未修改的变量
-                        new_lines.append(line)
-                else:
-                    # 如果行不符合格式，则直接保留
-                    new_lines.append(line)
-
-            # 写入临时文件，确保写入成功后再替换原文件
-            with tempfile.NamedTemporaryFile('w', delete=False, dir=script_dir, encoding='utf-8') as temp_file:
-                temp_file_name = temp_file.name
-                temp_file.writelines(new_lines)
-
-            # 替换原配置文件
-            shutil.move(temp_file_name, config_path)
-        except Exception as e:
-            # 捕获并记录异常，以便排查问题
-            raise Exception(f"更新配置文件失败: {e}")
+    """写入 config.local.json + .env，不再正则改 Python 源码。"""
+    save_structured_config(new_values or {})
 
 @app.route('/quick_start', methods=['GET', 'POST'])
 @login_required
@@ -792,11 +1159,33 @@ def quick_start():
 
             nicknames = request.form.getlist('nickname')
             prompt_files_form = request.form.getlist('prompt_file')
-            new_values['LISTEN_LIST'] = [
-                [nick.strip(), pf.strip()]
-                for nick, pf in zip(nicknames, prompt_files_form)
-                if nick.strip() and pf.strip()
-            ]
+            conversation_ids_form = request.form.getlist('conversation_id')
+            enabled_form = request.form.getlist('listen_enabled')
+            listen_rows, listen_error = listen_list_from_form(
+                nicknames, prompt_files_form, conversation_ids_form, enabled_form,
+            )
+            if listen_error:
+                return _json_error(
+                    listen_error['error'],
+                    listen_error['message'],
+                    listen_error.get('detail', ''),
+                    status=400,
+                    row=listen_error.get('row'),
+                    field=listen_error.get('field'),
+                )
+            from conversation_store import apply_listen_rows, project_listen_list, ConversationValidationError
+            from agent_store import ensure_agents_for_conversations
+            try:
+                conversations = apply_listen_rows(config, listen_rows)
+            except ConversationValidationError as conv_err:
+                return _json_error(conv_err.code, conv_err.message, conv_err.detail, status=400)
+            agents = ensure_agents_for_conversations(
+                conversations, config.get('AGENT_CONFIGS') or [], prompt_root=BASE_DIR,
+            )
+            listen_list = project_listen_list(conversations, agents)
+            new_values['LISTEN_LIST'] = listen_list
+            new_values['CONVERSATIONS'] = conversations
+            new_values['AGENT_CONFIGS'] = agents
             new_values['ENABLE_AUTO_MESSAGE'] = 'ENABLE_AUTO_MESSAGE' in request.form
             
             update_config(new_values)
@@ -807,10 +1196,7 @@ def quick_start():
 
     try:
         config = parse_config()
-        prompt_files_dir = 'prompts'
-        if not os.path.exists(prompt_files_dir):
-            os.makedirs(prompt_files_dir)
-        prompt_files_list = [f[:-3] for f in os.listdir(prompt_files_dir) if f.endswith('.md')]
+        prompt_files_list = list_prompt_names()
         
         current_api_provider = 'weapis'
         current_custom_base_url = ''
@@ -870,11 +1256,33 @@ def index():
              # 处理二维数组的LISTEN_LIST
             nicknames = request.form.getlist('nickname')
             prompt_files = request.form.getlist('prompt_file')
-            new_values['LISTEN_LIST'] = [
-                [nick.strip(), pf.strip()] 
-                for nick, pf in zip(nicknames, prompt_files) 
-                if nick.strip() and pf.strip()
-            ]
+            conversation_ids = request.form.getlist('conversation_id')
+            enabled_flags = request.form.getlist('listen_enabled')
+            listen_rows, listen_error = listen_list_from_form(
+                nicknames, prompt_files, conversation_ids, enabled_flags,
+            )
+            if listen_error:
+                return _json_error(
+                    listen_error['error'],
+                    listen_error['message'],
+                    listen_error.get('detail', ''),
+                    status=400,
+                    row=listen_error.get('row'),
+                    field=listen_error.get('field'),
+                )
+            from conversation_store import apply_listen_rows, project_listen_list, ConversationValidationError
+            from agent_store import ensure_agents_for_conversations
+            try:
+                conversations = apply_listen_rows(config, listen_rows)
+            except ConversationValidationError as conv_err:
+                return _json_error(conv_err.code, conv_err.message, conv_err.detail, status=400)
+            agents = ensure_agents_for_conversations(
+                conversations, config.get('AGENT_CONFIGS') or [], prompt_root=BASE_DIR,
+            )
+            listen_list = project_listen_list(conversations, agents)
+            new_values['LISTEN_LIST'] = listen_list
+            new_values['CONVERSATIONS'] = conversations
+            new_values['AGENT_CONFIGS'] = agents
 
             # 处理其他字段
             submitted_fields = set(request.form.keys()) - {'listen_list'} # listen_list 已处理
@@ -961,11 +1369,7 @@ def index():
                     new_values[field] = field in request.form # 统一处理，在表单中出现即为True
 
             update_config(new_values)
-            
-            # 验证配置文件类型正确性
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(script_dir, 'config.py')
-            validate_config_types(config_path)
+            validate_config_types()
             
             return redirect(url_for('index')) # 保存后重定向到自身以刷新GET请求
         except Exception as e:
@@ -975,10 +1379,7 @@ def index():
 
     # GET 请求
     try:
-        prompt_files_dir = 'prompts'
-        if not os.path.exists(prompt_files_dir):
-            os.makedirs(prompt_files_dir)
-        prompt_files = [f[:-3] for f in os.listdir(prompt_files_dir) if f.endswith('.md')]
+        prompt_files = list_prompt_names()
         config = parse_config() # 重新解析以获取最新配置
         chat_context_users = get_chat_context_users()
 
@@ -988,185 +1389,18 @@ def index():
         for field in api_key_fields:
             if field in display_config:
                 display_config[field] = hide_api_key(display_config[field])
+        display_config['LOGIN_PASSWORD'] = ''
+        display_config['WEBUI_PASSWORD_HASH'] = ''
+        display_config['FLASK_SECRET_KEY'] = ''
 
         return render_template('config_editor.html',
                              config=display_config,
                              prompt_files=prompt_files,
-                             chat_context_users=chat_context_users)
+                             chat_context_users=chat_context_users,
+                             listen_rows=ui_listen_rows(config))
     except Exception as e:
         app.logger.error(f"加载主配置页面错误: {e}")
         return "加载配置页面错误，请检查日志。"
-
-# 替换secure_filename的汉字过滤逻辑
-def safe_filename(filename):
-    # 只保留汉字、字母、数字、下划线和点，其他字符替换为_
-    filename = re.sub(r'[^\w\u4e00-\u9fff.]', '_', filename)
-    # 防止路径穿越
-    filename = filename.replace('../', '_').replace('/', '_')
-    return filename
-
-@app.route('/edit_prompt/<filename>', methods=['GET', 'POST'])
-@login_required
-def edit_prompt(filename):
-    safe_dir = os.path.abspath('prompts')
-    # 从path中移除.md后缀，如果存在的话，因为safe_filename会处理
-    if filename.endswith('.md'):
-        filename_no_ext = filename[:-3]
-    else:
-        filename_no_ext = filename
-    
-    # 使用 safe_filename 处理，并确保.md后缀
-    # 注意：前端JS在调用此接口时，filename参数应该是包含.md的
-    # 所以这里的safe_filename应该针对传入的filename
-    processed_filename = safe_filename(filename) 
-    filepath = os.path.join(safe_dir, processed_filename)
-
-    if request.method == 'POST':
-        content = request.form.get('content', '')
-        new_filename_from_form = request.form.get('filename', '').strip()
-
-        if not new_filename_from_form.endswith('.md'):
-            new_filename_from_form += '.md'
-        new_filename_safe = safe_filename(new_filename_from_form)
-        new_filepath = os.path.join(safe_dir, new_filename_safe)
-
-        try:
-            # 如果文件名改变了
-            if new_filename_safe != processed_filename:
-                if os.path.exists(new_filepath):
-                    return "新文件名已存在", 400 # 返回错误状态码
-                # 检查旧文件是否存在
-                if not os.path.exists(filepath):
-                     return "原文件不存在，无法重命名", 404
-                os.rename(filepath, new_filepath)
-                filepath = new_filepath # 更新filepath为新路径，以便写入内容
-            
-            # 写入内容
-            with open(filepath, 'w', encoding='utf-8', newline='') as f:
-                f.write(content)
-            # 修改后，不需要重定向到 prompt_list，前端会刷新或处理
-            return jsonify({'status': 'success', 'message': 'Prompt已保存'}), 200
-        except Exception as e:
-            app.logger.error(f"保存Prompt失败: {str(e)}")
-            return f"保存失败: {str(e)}", 500
-
-    # GET 请求部分: 返回JSON数据
-    try:
-        if not os.path.exists(filepath): # 确保文件存在
-            return jsonify({'error': '文件不存在'}), 404
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        # 返回JSON，而不是渲染模板
-        return jsonify({'filename': processed_filename, 'content': content})
-    except FileNotFoundError:
-        return jsonify({'error': '文件不存在'}), 404
-    except Exception as e:
-        app.logger.error(f"读取Prompt失败: {str(e)}")
-        return jsonify({'error': f'读取Prompt失败: {str(e)}'}), 500
-
-@app.route('/create_prompt', methods=['GET', 'POST'])
-@login_required
-def create_prompt():
-    if request.method == 'POST':
-        filename = request.form.get('filename', '').strip()
-        content = request.form.get('content', '')
-        
-        if not filename:
-            return "文件名不能为空", 400 # 返回错误状态码
-            
-        if not filename.endswith('.md'):
-            filename += '.md'
-        filename = safe_filename(filename) # 应用安全文件名处理
-        
-        filepath = os.path.join('prompts', filename)
-        if os.path.exists(filepath):
-            return "文件已存在", 409 # 409 Conflict 更合适
-            
-        try:
-            if not os.path.exists('prompts'): # 确保目录存在
-                os.makedirs('prompts')
-            with open(filepath, 'w', encoding='utf-8', newline='') as f:
-                f.write(content)
-            # 返回成功JSON，而不是重定向
-            return jsonify({'status': 'success', 'message': 'Prompt已创建'}), 201 # 201 Created
-        except Exception as e:
-            app.logger.error(f"创建Prompt失败: {str(e)}")
-            return f"创建失败: {str(e)}", 500
-    
-    return "此端点用于POST创建Prompt，或GET请求已被整合处理。", 405 # Method Not Allowed for GET
-
-@app.route('/delete_prompt/<filename>', methods=['POST'])
-@login_required
-def delete_prompt(filename):
-    safe_dir = os.path.abspath('prompts')
-    filepath = os.path.join(safe_dir, safe_filename(filename))
-    
-    if os.path.isfile(filepath) and filepath.startswith(safe_dir):
-        try:
-            os.remove(filepath)
-            return '', 204
-        except Exception as e:
-            return str(e), 500
-    return "无效文件", 400
-
-@app.route('/generate_prompt', methods=['POST'])
-@login_required
-def generate_prompt():
-    try:
-        # 从config.py获取配置
-        from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
-        
-        client = openai.OpenAI(
-            base_url=DEEPSEEK_BASE_URL,
-            api_key=DEEPSEEK_API_KEY
-        )
-        
-        prompt = request.json.get('prompt', '')
-        FixedPrompt = (
-            "\n请严格按照以下格式生成提示词（仅参考以下格式，将...替换为合适的内容，不要输出其他多余内容）。"
-            "\n注意：仅在<# 输出示例>部分需要输出以'\\'进行分隔的短句，且不输出逗号和句号，其它部分应当正常输出。"
-            "\n\n# 任务"
-            "\n你需要扮演指定角色，根据角色的经历，模仿她的语气进行线上的日常对话。"
-            "\n\n# 角色"
-            "\n你将扮演...。"
-            "\n\n# 外表"
-            "\n...。"
-            "\n\n# 经历"
-            "\n...。"
-            "\n\n# 性格"
-            "\n...。"
-            "\n# 输出示例"
-            "\n...\\...\\..."
-            "\n...\\..."
-            "\n\n# 喜好"
-            "\n...。\n"
-        )  # 固定提示词
-        
-        config = parse_config()
-        temperature = config.get('TEMPERATURE', 0.7)
-
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=[{
-            "role": "user",
-            "content": prompt + FixedPrompt
-            }],
-            temperature=temperature,
-            max_tokens=5000
-        )
-        
-        reply = completion.choices[0].message.content
-        if "</think>" in reply:
-            reply = reply.split("</think>", 1)[1].strip()
-
-        return jsonify({
-            'result': reply
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# 获取所有提醒 
 @app.route('/get_all_reminders')
 @login_required
 def get_all_reminders():
@@ -1194,7 +1428,6 @@ def get_all_reminders():
     except Exception as e:
         app.logger.error(f"获取所有提醒失败: {str(e)}")
         return jsonify({'error': f'获取所有提醒失败: {str(e)}'}), 500
-
 
 # 重命名: 保存所有提醒 (覆盖整个文件)
 @app.route('/save_all_reminders', methods=['POST']) # <--- Route Renamed
@@ -1724,8 +1957,7 @@ def receive_bot_log():
             if isinstance(logs_data, list):
                 for log_entry in logs_data:
                     if log_entry:
-                        # 添加进程标识和颜色标记
-                        colored_log = f"[BOT] \033[34m{log_entry.strip()}\033[0m"
+                        colored_log = f"[BOT] \033[34m{mask_secrets(str(log_entry).strip())}\033[0m"
                         log_queue.put(colored_log)
                 return jsonify({'status': 'success', 'processed': len(logs_data)})
             return jsonify({'error': 'Invalid logs format'}), 400
@@ -1733,8 +1965,7 @@ def receive_bot_log():
         elif 'log' in request.json:  # 兼容单条日志格式
             log_data = request.json.get('log')
             if log_data:
-                # 添加进程标识和颜色标记
-                colored_log = f"[BOT] \033[34m{log_data.strip()}\033[0m"
+                colored_log = f"[BOT] \033[34m{mask_secrets(str(log_data).strip())}\033[0m"
                 log_queue.put(colored_log)
             return jsonify({'status': 'success'})
             
@@ -1744,564 +1975,10 @@ def receive_bot_log():
     except Exception as e:
         app.logger.error(f"日志接收失败: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/get_chat_context_users', methods=['GET'])
-@login_required
-def api_get_chat_context_users():
-    users = get_chat_context_users()
-    return jsonify({'users': users})
-
-@app.route('/clear_chat_context/<username>', methods=['POST'])
-@login_required
-def clear_chat_context(username):
-    """清除指定用户的聊天上下文"""
-    if not os.path.exists(CHAT_CONTEXTS_FILE):
-        return jsonify({'status': 'error', 'message': '聊天上下文文件不存在'}), 404
-
-    with FileLock(CHAT_CONTEXTS_LOCK_FILE):
-        try:
-            with open(CHAT_CONTEXTS_FILE, 'r+', encoding='utf-8') as f:
-                data = json.load(f)
-                if username in data:
-                    del data[username]
-                    f.seek(0) # 回到文件开头
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                    f.truncate() # 删除剩余内容
-                    return jsonify({'status': 'success', 'message': f"用户 '{username}' 的聊天上下文已清除"})
-                else:
-                    return jsonify({'status': 'error', 'message': f"用户 '{username}' 未找到"}), 404
-        except (json.JSONDecodeError, IOError) as e:
-            app.logger.error(f"处理 chat_contexts.json 失败: {e}")
-            return jsonify({'status': 'error', 'message': '处理聊天上下文文件失败'}), 500
-
-# 聊天上下文编辑API
-@app.route('/api/get_chat_context/<username>', methods=['GET'])
-@login_required
-def get_user_chat_context(username):
-    """获取指定用户的聊天上下文"""
-    if not os.path.exists(CHAT_CONTEXTS_FILE):
-        return jsonify({'error': '聊天上下文文件未找到'}), 404
-
-    with FileLock(CHAT_CONTEXTS_LOCK_FILE):
-        try:
-            with open(CHAT_CONTEXTS_FILE, 'r', encoding='utf-8') as f:
-                contexts = json.load(f)
-            user_context = contexts.get(username)
-            if user_context is None:
-                return jsonify({'error': f"用户 '{username}' 在上下文中不存在"}), 404
-            pretty_context = json.dumps(user_context, ensure_ascii=False, indent=4)
-            return jsonify({'status': 'success', 'context': pretty_context})
-        except (json.JSONDecodeError, IOError) as e:
-            app.logger.error(f"读取或解析聊天上下文文件失败: {e}")
-            return jsonify({'error': f'读取或解析文件失败: {e}'}), 500
-
-@app.route('/api/save_chat_context/<username>', methods=['POST'])
-@login_required
-def save_user_chat_context(username):
-    """保存指定用户修改后的聊天上下文，强制合并连续user消息，确保user→assistant结构"""
-    if bot_process and bot_process.poll() is not None:
-        return jsonify({'error': '程序正在运行，请先停止再保存上下文'}), 400
-    data = request.get_json()
-    if not data or 'context' not in data:
-        return jsonify({'status': 'error', 'message': '请求无效，缺少 "context" 字段'}), 400
-    new_context_str = data['context']
-    try:
-        new_context_data = json.loads(new_context_str)
-        if not isinstance(new_context_data, list):
-            raise ValueError("上下文数据必须是一个JSON数组 (list)")
-        # --- 强制合并连续user，保证user→assistant结构 ---
-        merged_context = []
-        user_buffer = []
-        for item in new_context_data:
-            if item.get('role') == 'user':
-                user_buffer.append(item.get('content', ''))
-            elif item.get('role') == 'assistant':
-                if user_buffer:
-                    merged_context.append({'role': 'user', 'content': '\n'.join(user_buffer)})
-                    user_buffer = []
-                merged_context.append(item)
-        if user_buffer:
-            merged_context.append({'role': 'user', 'content': '\n'.join(user_buffer)})
-        # --- END ---
-    except (json.JSONDecodeError, ValueError) as e:
-        return jsonify({'status': 'error', 'message': f'格式错误: {str(e)}'}), 400
-    with FileLock(CHAT_CONTEXTS_LOCK_FILE):
-        try:
-            if not os.path.exists(CHAT_CONTEXTS_FILE):
-                return jsonify({'status': 'error', 'message': '聊天上下文文件未找到'}), 404
-            with open(CHAT_CONTEXTS_FILE, 'r', encoding='utf-8') as f:
-                all_contexts = json.load(f)
-            if username not in all_contexts:
-                return jsonify({'status': 'error', 'message': '用户在上下文中不存在'}), 404
-            all_contexts[username] = merged_context
-            temp_file_path = CHAT_CONTEXTS_FILE + ".tmp"
-            with open(temp_file_path, 'w', encoding='utf-8') as f:
-                json.dump(all_contexts, f, ensure_ascii=False, indent=4)
-            shutil.move(temp_file_path, CHAT_CONTEXTS_FILE)
-        except Exception as e:
-            app.logger.error(f"保存聊天上下文失败: {e}")
-            return jsonify({'status': 'error', 'message': f'保存失败: {str(e)}'}), 500
-    return jsonify({'status': 'success', 'message': f"用户 '{username}' 的上下文已更新"})
-
-@app.route('/api/npc/save_settings', methods=['POST'])
-@login_required
-def save_npc_settings():
-    """保存NPC配置"""
-    try:
-        data = request.json
-        if not data:
-            return jsonify({'error': '无效的数据'}), 400
-        
-        app.logger.info(f"接收到NPC配置数据: {data}")
-        
-        # 保存NPC配置到文件
-        npc_config_file = _npc_config_file_path()
-        
-        # 读取现有配置
-        existing_config = {}
-        if os.path.exists(npc_config_file):
-            try:
-                with open(npc_config_file, 'r', encoding='utf-8') as f:
-                    existing_config = json.load(f)
-                app.logger.info(f"读取现有配置: {existing_config}")
-            except Exception as read_error:
-                app.logger.warning(f"读取现有配置失败，使用空配置: {read_error}")
-                existing_config = {}
-        
-        # 更新配置 - 使用更精确的更新逻辑
-        app.logger.info(f"接收到的数据: {data}")
-        
-        # 更新选中的NPC列表
-        if 'selected_npcs' in data:
-            existing_config['selected_npcs'] = data['selected_npcs']
-            app.logger.info(f"更新选中的NPC列表: {data['selected_npcs']}")
-        
-        # 更新NPC设置
-        if 'npc_settings' in data:
-            if 'npc_settings' not in existing_config:
-                existing_config['npc_settings'] = {}
-            
-            for npc_name, npc_data in data['npc_settings'].items():
-                # 清理不需要的字段（移除 model_type）
-                try:
-                    if isinstance(npc_data, dict) and 'model_type' in npc_data:
-                        npc_data.pop('model_type', None)
-                except Exception:
-                    pass
-                
-                existing_config['npc_settings'][npc_name] = npc_data
-                app.logger.info(f"更新NPC {npc_name} 的设置: {npc_data}")
-
-        
-        app.logger.info(f"合并后的配置: {existing_config}")
-        
-        # 验证配置格式
-        if 'selected_npcs' in existing_config and 'npc_settings' in existing_config:
-            # 确保所有选中的NPC都有对应的设置
-            for npc_name in existing_config['selected_npcs']:
-                if npc_name not in existing_config['npc_settings']:
-                    app.logger.warning(f"NPC {npc_name} 被选中但没有设置，将添加默认设置")
-                    existing_config['npc_settings'][npc_name] = {
-                        'language_style': 'casual',
-                        'relationship': 'friend',
-                        'example_output': '',
-                        'other_settings': ''
-                    }
-                else:
-                    app.logger.info(f"NPC {npc_name} 设置已更新")
-        
-        # 保存配置
-        with open(npc_config_file, 'w', encoding='utf-8') as f:
-            json.dump(existing_config, f, ensure_ascii=False, indent=2)
-        
-        app.logger.info(f"成功保存NPC配置到文件: {npc_config_file}")
-        
-        # 验证保存是否成功
-        try:
-            with open(npc_config_file, 'r', encoding='utf-8') as f:
-                saved_config = json.load(f)
-            app.logger.info(f"验证保存的配置: {saved_config}")
-        except Exception as verify_error:
-            app.logger.error(f"验证保存配置失败: {verify_error}")
-            return jsonify({'error': '配置保存后验证失败'}), 500
-        
-        return jsonify({
-            'success': True, 
-            'message': 'NPC配置保存成功',
-            'saved_config': saved_config
-        })
-        
-    except Exception as e:
-        app.logger.error(f"保存NPC配置失败: {e}")
-        return jsonify({'error': f'保存失败: {str(e)}'}), 500
-
-@app.route('/api/npc/get_settings', methods=['GET'])
-@login_required
-def get_npc_settings():
-    """获取NPC配置"""
-    try:
-        npc_config_file = _npc_config_file_path()
-        
-        if os.path.exists(npc_config_file):
-            try:
-                with open(npc_config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                app.logger.info(f"成功读取NPC配置: {config}")
-                
-                # 确保配置格式完整
-                if 'selected_npcs' not in config:
-                    config['selected_npcs'] = []
-                if 'npc_settings' not in config:
-                    config['npc_settings'] = {}
-                
-                # 为每个选中的NPC确保有默认设置
-                for npc_name in config.get('selected_npcs', []):
-                    if npc_name not in config.get('npc_settings', {}):
-                        config['npc_settings'][npc_name] = {
-                            'language_style': 'casual',
-                            'relationship': 'friend',
-                            'example_output': '',
-                            'other_settings': ''
-                        }
-                        app.logger.info(f"为NPC {npc_name} 添加默认设置")
-                    else:
-                        # 清理不需要的字段（移除 model_type）
-                        if isinstance(config['npc_settings'][npc_name], dict):
-                            config['npc_settings'][npc_name].pop('model_type', None)
-                        app.logger.info(f"NPC {npc_name} 已有设置: {config['npc_settings'][npc_name]}")
-                
-                return jsonify(config)
-            except Exception as read_error:
-                app.logger.error(f"读取NPC配置文件失败: {read_error}")
-                return jsonify({'error': f'读取配置失败: {str(read_error)}'}), 500
-        else:
-            #app.logger.info("NPC配置文件不存在，返回空配置")
-            return jsonify({
-                'selected_npcs': [],
-                'npc_settings': {}
-            })
-            
-    except Exception as e:
-        app.logger.error(f"获取NPC配置失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-# 核心记忆管理API
-@app.route('/api/get_core_memory_files', methods=['GET'])
-@login_required
-def get_core_memory_files():
-    """获取核心记忆文件列表"""
-    try:
-        # 从配置中获取核心记忆目录
-        config = parse_config()
-        core_memory_dir = os.path.join(os.path.dirname(__file__), config.get('CORE_MEMORY_DIR', 'CoreMemory'))
-        
-        # 确保目录存在
-        os.makedirs(core_memory_dir, exist_ok=True)
-        
-        files = []
-        if os.path.exists(core_memory_dir):
-            for filename in os.listdir(core_memory_dir):
-                if filename.endswith('_core_memory.json'):
-                    file_path = os.path.join(core_memory_dir, filename)
-                    try:
-                        # 读取文件获取记忆片段数量
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            memories = json.load(f)
-                        
-                        memory_count = len(memories) if isinstance(memories, list) else 0
-                        
-                        # 获取文件修改时间
-                        mtime = os.path.getmtime(file_path)
-                        last_modified = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
-                        
-                        # 从文件名提取显示名称
-                        display_name = filename.replace('_core_memory.json', '').replace('_', ' - ')
-                        
-                        files.append({
-                            'filename': filename,
-                            'display_name': display_name,
-                            'memory_count': memory_count,
-                            'last_modified': last_modified
-                        })
-                    except Exception as e:
-                        app.logger.warning(f"读取核心记忆文件 {filename} 失败: {e}")
-                        continue
-        
-        # 按修改时间倒序排列
-        files.sort(key=lambda x: x['last_modified'], reverse=True)
-        
-        return jsonify({'status': 'success', 'files': files})
-        
-    except Exception as e:
-        app.logger.error(f"获取核心记忆文件列表失败: {e}")
-        return jsonify({'status': 'error', 'message': f'获取失败: {str(e)}'}), 500
-
-@app.route('/api/get_core_memory/<filename>', methods=['GET'])
-@login_required  
-def get_core_memory(filename):
-    """获取指定核心记忆文件的内容"""
-    try:
-        # 验证文件名安全性
-        if not filename.endswith('_core_memory.json'):
-            return jsonify({'status': 'error', 'error': '无效的文件名'}), 400
-            
-        config = parse_config()
-        core_memory_dir = os.path.join(os.path.dirname(__file__), config.get('CORE_MEMORY_DIR', 'CoreMemory'))
-        file_path = os.path.join(core_memory_dir, filename)
-        
-        if not os.path.exists(file_path):
-            return jsonify({'status': 'error', 'error': '文件不存在'}), 404
-        
-        # 读取记忆文件
-        with open(file_path, 'r', encoding='utf-8') as f:
-            memories = json.load(f)
-        
-        # 确保返回的是列表格式
-        if not isinstance(memories, list):
-            memories = []
-        
-        # 字段名兼容性处理：处理旧版本的time字段，统一使用timestamp字段
-        for memory in memories:
-            if isinstance(memory, dict):
-                # 如果有旧版本的time字段但没有timestamp字段，则将time转换为timestamp
-                if 'time' in memory and 'timestamp' not in memory:
-                    memory['timestamp'] = memory['time']
-                    del memory['time']  # 删除旧字段，避免冗余
-            
-        return jsonify({'status': 'success', 'memories': memories})
-        
-    except Exception as e:
-        app.logger.error(f"获取核心记忆文件 {filename} 失败: {e}")
-        return jsonify({'status': 'error', 'error': f'读取失败: {str(e)}'}), 500
-
-@app.route('/api/save_core_memory/<filename>', methods=['POST'])
-@login_required
-def save_core_memory(filename):
-    """保存核心记忆到指定文件"""
-    try:
-        # 验证文件名安全性
-        if not filename.endswith('_core_memory.json'):
-            return jsonify({'status': 'error', 'message': '无效的文件名'}), 400
-            
-        data = request.json
-        memories = data.get('memories', [])
-        
-        # 验证数据格式
-        if not isinstance(memories, list):
-            return jsonify({'status': 'error', 'message': '记忆数据必须是数组格式'}), 400
-        
-        # 验证每个记忆片段的格式
-        for i, memory in enumerate(memories):
-            if not isinstance(memory, dict):
-                return jsonify({'status': 'error', 'message': f'第{i+1}个记忆片段格式错误'}), 400
-            
-            # 字段名兼容性检查：支持time字段，但统一转换为timestamp
-            if 'time' in memory and 'timestamp' not in memory:
-                memory['timestamp'] = memory['time']
-                del memory['time']  # 删除旧字段，避免冗余
-            
-            # 验证必要字段
-            if 'timestamp' not in memory or 'importance' not in memory or 'summary' not in memory:
-                return jsonify({'status': 'error', 'message': f'第{i+1}个记忆片段缺少必要字段(timestamp、importance、summary)'}), 400
-                
-            if not isinstance(memory['importance'], int) or not (1 <= memory['importance'] <= 10):
-                return jsonify({'status': 'error', 'message': f'第{i+1}个记忆片段的重要度必须是1-10的整数'}), 400
-        
-        config = parse_config()
-        core_memory_dir = os.path.join(os.path.dirname(__file__), config.get('CORE_MEMORY_DIR', 'CoreMemory'))
-        os.makedirs(core_memory_dir, exist_ok=True)
-        
-        file_path = os.path.join(core_memory_dir, filename)
-        
-        # 保存记忆文件
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(memories, f, ensure_ascii=False, indent=2)
-        
-        app.logger.info(f"已保存核心记忆文件: {filename}")
-        return jsonify({'status': 'success', 'message': '核心记忆已保存'})
-        
-    except Exception as e:
-        app.logger.error(f"保存核心记忆文件 {filename} 失败: {e}")
-        return jsonify({'status': 'error', 'message': f'保存失败: {str(e)}'}), 500
-
-@app.route('/api/delete_core_memory/<filename>', methods=['DELETE'])
-@login_required
-def delete_core_memory(filename):
-    """删除核心记忆文件"""
-    try:
-        # 验证文件名安全性
-        if not filename.endswith('_core_memory.json'):
-            return jsonify({'status': 'error', 'message': '无效的文件名'}), 400
-            
-        config = parse_config()
-        core_memory_dir = os.path.join(os.path.dirname(__file__), config.get('CORE_MEMORY_DIR', 'CoreMemory'))
-        file_path = os.path.join(core_memory_dir, filename)
-        
-        if not os.path.exists(file_path):
-            return jsonify({'status': 'error', 'message': '文件不存在'}), 404
-        
-        # 删除文件
-        os.remove(file_path)
-        
-        app.logger.info(f"已删除核心记忆文件: {filename}")
-        return jsonify({'status': 'success', 'message': '核心记忆文件已删除'})
-        
-    except Exception as e:
-        app.logger.error(f"删除核心记忆文件 {filename} 失败: {e}")
-        return jsonify({'status': 'error', 'message': f'删除失败: {str(e)}'}), 500
-
 def run_bat_file():
     bat_file_path = "一键检测.bat"
     if os.path.exists(bat_file_path):
         os.system(f"start {bat_file_path}")
-
-from multiprocessing import Process
-import random
-from datetime import datetime, timedelta
-@app.route('/forum/<character_name>')
-@login_required
-def character_forum(character_name):
-    """AI角色论坛页面"""
-    try:
-        config = parse_config()
-        
-        # 验证角色名是否存在于配置中
-        listen_list = config.get('LISTEN_LIST', [])
-        character_found = False
-        for item in listen_list:
-            if len(item) >= 2 and item[1] == character_name:
-                character_found = True
-                break
-        
-        if not character_found:
-            return "角色不存在", 404
-        
-        return render_template('character_forum.html', character_name=character_name)
-    
-    except Exception as e:
-        app.logger.error(f"加载论坛页面失败: {e}")
-        return "加载论坛页面失败", 500
-
-@app.route('/api/forum/refresh/<character_name>', methods=['POST'])
-@login_required
-def refresh_forum(character_name):
-    """刷新论坛内容API"""
-    try:
-        config = parse_config()
-        
-        # 验证角色名
-        listen_list = config.get('LISTEN_LIST', [])
-        character_found = False
-        for item in listen_list:
-            if len(item) >= 2 and item[1] == character_name:
-                character_found = True
-                break
-        
-        if not character_found:
-            return jsonify({'error': '角色不存在'}), 404
-        
-        # 调用AI判断是否发论坛
-        app.logger.info(f"开始为角色 {character_name} 刷新论坛")
-        should_post, content = check_should_post_forum(character_name)
-        app.logger.info(f"AI判断结果: should_post={should_post}, content='{content}'")
-        
-        if should_post:
-            # 添加新论坛内容
-            forum_post = add_forum_post(character_name, content)
-            app.logger.info(f"成功添加论坛帖子: {forum_post['id'] if forum_post else 'None'}")
-            return jsonify({
-                'has_new_content': True,
-                'post': forum_post
-            })
-        else:
-            return jsonify({
-                'has_new_content': False,
-                'message': '暂时没有新的论坛动态'
-            })
-    
-    except Exception as e:
-        app.logger.error(f"刷新论坛失败: {e}")
-        return jsonify({'error': f'刷新失败: {str(e)}'}), 500
-
-@app.route('/api/forum/posts/<character_name>')
-@login_required
-def get_forum_posts(character_name):
-    """获取论坛历史帖子"""
-    try:
-        config = parse_config()
-        
-        posts = get_character_forum_posts(character_name)
-        return jsonify({'posts': posts})
-    
-    except Exception as e:
-        app.logger.error(f"获取论坛帖子失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-@app.route('/api/forum/delete/<character_name>/<post_id>', methods=['DELETE'])
-@login_required
-def delete_forum_post(character_name, post_id):
-    """删除角色论坛帖子API"""
-    try:
-        app.logger.info(f"开始删除角色 {character_name} 的帖子 {post_id}")
-        
-        # 验证角色名
-        config = parse_config()
-        listen_list = config.get('LISTEN_LIST', [])
-        character_found = False
-        for item in listen_list:
-            if len(item) >= 2 and item[1] == character_name:
-                character_found = True
-                break
-        
-        if not character_found:
-            return jsonify({'error': '角色不存在'}), 404
-        
-        # 删除帖子
-        success = delete_forum_post_by_id(character_name, post_id)
-        
-        if success:
-            app.logger.info(f"成功删除帖子 {post_id}")
-            return jsonify({'message': '删除成功'})
-        else:
-            app.logger.error(f"删除帖子 {post_id} 失败")
-            return jsonify({'error': '帖子不存在或删除失败'}), 404
-    
-    except Exception as e:
-        app.logger.error(f"删除论坛帖子失败: {e}")
-        return jsonify({'error': f'删除失败: {str(e)}'}), 500
-
-@app.route('/test_forum_ai/<character_name>')
-@login_required
-def test_forum_ai(character_name):
-    """测试AI论坛判断逻辑"""
-    try:
-        config = parse_config()
-
-        
-        app.logger.info(f"测试AI判断逻辑，角色: {character_name}")
-        should_post, content = check_should_post_forum(character_name)
-        
-        result = {
-            "character": character_name,
-            "should_post": should_post,
-            "content": content,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        return f"""
-        <h2>AI判断测试结果</h2>
-        <p><strong>角色:</strong> {character_name}</p>
-        <p><strong>判断结果:</strong> {'发布' if should_post else '不发布'}</p>
-        <p><strong>生成内容:</strong> {content}</p>
-        <p><strong>测试时间:</strong> {result['timestamp']}</p>
-        <hr>
-        <p><a href="javascript:history.back()">返回</a> | <a href="/forum/{character_name}" target="_blank">查看论坛</a></p>
-        """
-        
-    except Exception as e:
-        app.logger.error(f"测试AI判断失败: {e}")
-        return f"测试失败: {str(e)}", 500
-
 @app.route('/run_one_key_detection', methods=['GET'])
 def run_one_key_detection():
     bat_file_path = "一键检测.bat"
@@ -2342,1382 +2019,84 @@ def show_bzwd_page():
     except Exception as e:
         app.logger.error(f"加载bzwd.html页面失败: {e}")
         return "页面加载失败，请检查日志", 500
-
-def check_should_post_forum(character_name):
-    """调用AI判断是否发论坛内容"""
-    try:
-        app.logger.info(f"检查角色 {character_name} 是否应该发布论坛内容")
-        config = parse_config()
-        
-        # 读取角色设定
-        character_prompt = load_character_prompt(character_name)
-        if not character_prompt:
-            app.logger.warning(f"无法加载角色 {character_name} 的设定文件")
-            return False, ""
-        
-        app.logger.info(f"成功加载角色设定，长度: {len(character_prompt)} 字符")
-        
-        # 构建AI提示
-        current_time = datetime.now()
-        time_str = current_time.strftime("%Y-%m-%d %H:%M")
-        
-        # 获取最近的论坛历史（用于避免重复）
-        recent_posts = get_character_forum_posts(character_name, limit=5)
-        recent_content = ""
-        if recent_posts:
-            recent_content = "\n最近发过的内容：\n" + "\n".join([f"- {post['content']}" for post in recent_posts[:3]])
-        
-        # --- 新增：50%概率的联网热点检索 ---
-        import random
-        online_hot_brief = ''
-        should_use_online = random.random() < 0.5  # 50%概率
-        
-        if should_use_online and bool(config.get('ENABLE_ONLINE_API', False)):
-            online_api_key = (config.get('ONLINE_API_KEY') or '').strip()
-            online_base_url = config.get('ONLINE_BASE_URL', 'https://vg.v1api.cc/v1')
-            online_model = config.get('ONLINE_MODEL', 'net-gpt-4o-mini')
-            online_temperature = float(config.get('ONLINE_API_TEMPERATURE', 0.7))
-            online_max_tokens = int(config.get('ONLINE_API_MAX_TOKEN', 2000))
-
-            if online_api_key:
-                try:
-                    app.logger.info(f"尝试使用联网模型获取实时热点信息")
-                    online_prompt = (
-                        "请用简洁要点汇总'今天'中文互联网主要新闻与热点（3-5条），不要涉及政治敏感话题和政治人物。"
-                        "偏向话题与趋势，不要细节长文；每条不超过30字；"
-                        "只输出纯文本多行，不要编号、不要任何额外解释。"
-                    )
-                    online_client = openai.OpenAI(base_url=online_base_url, api_key=online_api_key, timeout=20)
-                    online_completion = online_client.chat.completions.create(
-                        model=online_model,
-                        messages=[{"role": "user", "content": online_prompt}],
-                        temperature=online_temperature,
-                        max_tokens=min(online_max_tokens, 300),
-                        timeout=20
-                    )
-                    online_hot_brief = (online_completion.choices[0].message.content or '').strip()
-                    # 只保留前5行，避免上下文过长
-                    if online_hot_brief:
-                        lines_hot = [ln.strip() for ln in online_hot_brief.split('\n') if ln.strip()]
-                        online_hot_brief = "\n".join(lines_hot[:5])
-                        app.logger.info(f"成功获取联网热点信息，长度: {len(online_hot_brief)} 字符")
-                except Exception as online_err:
-                    app.logger.warning(f"联网热点检索失败，将使用常规生成: {online_err}")
-                    online_hot_brief = ''
-            else:
-                app.logger.info("联网API密钥未配置，跳过热点检索")
-        else:
-            if should_use_online:
-                app.logger.info("联网功能未启用，跳过热点检索")
-            else:
-                app.logger.info("本次未触发联网热点检索（50%概率）")
-        
-        # 构建融合热点的prompt
-        if online_hot_brief:
-            prompt = f"""
-你有一个瞒着用户的小号推特账号，人设中的朋友圈人物都知道这个账号并会互动，你会在这里发一些比较真实的想法和日常。
-
-角色设定：
-{character_prompt}
-
-当前时间：{time_str}
-{recent_content}
-
-今日热点参考（可选择性融合，避免机械复述，可以结合相关话题氛围发表个人感受）：
-{online_hot_brief}
-
-内容类型和tag使用：
-1. 普通动态 - 直接发内容，不需要特殊标记
-2. 备忘录类 - 用 #备忘录 tag
-3. 情感宣泄 - 用 #心情 #想法 等tag
-4. 日常记录 - 用 #日常 #生活 等tag
-5. 重要事件 - 用 #记录 #重要 等tag
-6. 热点评论 - 结合热点话题发表个人看法，可用相关tag
-
-请根据角色性格和当前状态，可以结合今日热点话题（如果感兴趣），生成一条自然的推特动态。
-
-要求：
-- 情感表达直接、真实
-- 具有活人感、可以适当结合网络热梗
-- 短句不用句号
-- 可以使用相关的tag（用#开头）
-- 内容长度适中，像真实的推特发言
-- 此次输出按一句或者一段话话，正常标点符号，不需要加反斜线
-- 如果要评论热点，请结合个人角色特点和感受，不要流水账式复述
-
-直接输出动态内容，不需要"内容："前缀。
-"""
-        else:
-            prompt = f"""
-你有一个瞒着用户的小号推特账号，人设中的朋友圈人物都知道这个账号并会互动，你会在这里发一些比较真实的想法和日常。
-
-角色设定：
-{character_prompt}
-
-当前时间：{time_str}
-{recent_content}
-
-内容类型和tag使用：
-1. 普通动态 - 直接发内容，不需要特殊标记
-2. 备忘录类 - 用 #备忘录 tag
-3. 情感宣泄 - 用 #心情 #想法 等tag
-4. 日常记录 - 用 #日常 #生活 等tag
-5. 重要事件 - 用 #记录 #重要 等tag
-
-请根据角色性格和当前状态，随机选择一种内容类型，生成一条自然的推特动态。
-
-要求：
-- 情感表达直接、真实
-- 具有活人感、可以适当结合网络热梗
-- 短句不用句号
-- 可以使用相关的tag（用#开头）
-- 内容长度适中，像真实的推特发言
-- 此次输出按一句或者一段话话，正常标点符号，不需要加反斜线
-
-直接输出动态内容，不需要"内容："前缀。
-"""
-
-        # 打印完整提示词到控制台，方便调试
-        print("\n" + "="*80)
-        print(f"🎯 论坛拉取请求 - 角色: {character_name}")
-        print("="*80)
-        print(f"📊 提示词统计:")
-        print(f"   角色设定长度: {len(character_prompt)} 字符")
-        print(f"   总提示词长度: {len(prompt)} 字符")
-        print(f"   当前时间: {time_str}")
-        print(f"   最近内容数量: {len(recent_posts) if recent_posts else 0}")
-        print(f"   联网热点检索: {'已启用' if online_hot_brief else '未启用'}")
-        if online_hot_brief:
-            print(f"   热点内容长度: {len(online_hot_brief)} 字符")
-        print("="*80 + "\n")
-        
-        # 调用AI API - 优先使用论坛自定义模型，其次主模型
-        use_forum_custom = bool(config.get('ENABLE_FORUM_CUSTOM_MODEL', False))
-        if use_forum_custom:
-            api_key = (config.get('FORUM_API_KEY') or config.get('DEEPSEEK_API_KEY', '')).strip()
-            base_url = config.get('FORUM_BASE_URL', config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1'))
-            # 如果未填写论坛模型则回落到主模型
-            model = (config.get('FORUM_MODEL') or config.get('MODEL', 'deepseek-v3-0324'))
-            temperature = config.get('FORUM_TEMPERATURE', config.get('TEMPERATURE', 1.1))
-            max_tokens = int(config.get('FORUM_MAX_TOKEN', config.get('MAX_TOKEN', 2000)))
-        else:
-            api_key = config.get('DEEPSEEK_API_KEY', '')
-            base_url = config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1')
-            model = config.get('MODEL', 'deepseek-v3-0324')
-            temperature = config.get('TEMPERATURE', 1.1)
-            max_tokens = config.get('MAX_TOKEN', 2000)
-        
-        app.logger.info(f"准备调用AI API，模型: {model}, base_url: {base_url}")
-        
-        if not api_key:
-            app.logger.error("API密钥未配置")
-            return False, ""
-        
-        client = openai.OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=30  # 设置30秒超时
-        )
-        
-        app.logger.info("开始调用AI API...")
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=30  # API调用超时设置
-        )
-        
-        reply = completion.choices[0].message.content.strip()
-        app.logger.info(f"AI回复: {reply}")
-        
-        # 打印AI响应到控制台，方便调试
-        print(f"🤖 AI模型响应:")
-        print(f"   模型: {model}")
-        print(f"   联网热点: {'已使用' if online_hot_brief else '未使用'}")
-        print(f"   响应内容: '{reply}'")
-        print(f"   响应长度: {len(reply) if reply else 0} 字符")
-        print(f"   是否为空: {'是' if not reply else '否'}")
-        print("="*80 + "\n")
-        
-        # 简化的解析逻辑 - 直接使用AI的回复作为内容
-        if reply and len(reply) > 5:
-            # 清理可能的格式标记
-            content = reply
-            
-            # 移除可能的"内容："前缀（如果AI还是加了的话）
-            if content.startswith("内容：") or content.startswith("内容:"):
-                content = content.split("：", 1)[-1].split(":", 1)[-1].strip()
-            
-            # 移除一些明显的格式字符
-            content = content.replace("[具体的动态内容]", "").strip()
-            
-            # 自动替换反斜线为换行符
-            content = content.replace("\\", "\n")
-            
-            if len(content) > 5:
-                return True, content
-        
-        return False, ""
-    
-    except Exception as e:
-        app.logger.error(f"调用AI判断论坛发布失败: {e}")
-        # 如果API调用失败，生成一个简单的默认内容
-        import random
-        default_contents = [
-            "今天心情不错呢~",
-            "分享一下今天的小心情",
-            "生活总是充满惊喜",
-            "又是美好的一天",
-            "想和大家分享一些想法",
-            "今天有点特别的感觉",
-            "心情很好，想说点什么",
-            "日常的小确幸"
-        ]
-        return True, random.choice(default_contents)
-
-def load_character_prompt(character_name):
-    """读取角色设定文件"""
-    try:
-        prompt_file = os.path.join('prompts', f'{character_name}.md')
-        if os.path.exists(prompt_file):
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                return f.read()
-        return None
-    except Exception as e:
-        app.logger.error(f"读取角色设定失败: {e}")
-        return None
-
-def get_character_forum_posts(character_name, limit=20):
-    """获取角色论坛帖子"""
-    try:
-        forum_file = _forum_file_path(character_name)
-        if not os.path.exists(forum_file):
-            return []
-        
-        with open(forum_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        posts = data.get('posts', [])
-        # 按时间倒序排列
-        posts.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        
-        return posts[:limit] if limit else posts
-    
-    except Exception as e:
-        app.logger.error(f"获取论坛帖子失败: {e}")
-        return []
-
-def _forum_file_path(character_name):
-    _ensure_forum_dir_exists()
-    filename = f'forum_data_{character_name}.json'
-    return os.path.join(FORUM_DATA_DIR, filename)
-
-def load_forum_data(character_name):
-    """加载论坛数据文件"""
-    forum_file = _forum_file_path(character_name)
-    if os.path.exists(forum_file):
-        try:
-            with open(forum_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {'posts': [], 'npcs': []}
-    return {'posts': [], 'npcs': []}
-
-def save_forum_data(character_name, data):
-    """保存论坛数据文件（覆盖写入）"""
-    forum_file = _forum_file_path(character_name)
-    with open(forum_file, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def _find_post_by_id(posts, post_id):
-    for post in posts:
-        if post.get('id') == post_id:
-            return post
-    return None
-
-def toggle_like_forum_post(character_name, post_id, like_state=None):
-    """切换或设置帖子点赞状态。like_state=None 表示切换；True/False 表示显式设置"""
-    data = load_forum_data(character_name)
-    posts = data.get('posts', [])
-    post = _find_post_by_id(posts, post_id)
-    if not post:
-        return None
-    current_liked = bool(post.get('liked_by_me', False))
-    new_liked = (not current_liked) if like_state is None else bool(like_state)
-    likes_count = int(post.get('likes', 0) or 0)
-    if new_liked != current_liked:
-        if new_liked:
-            likes_count += 1
-        else:
-            likes_count = max(0, likes_count - 1)
-        post['likes'] = likes_count
-        post['liked_by_me'] = new_liked
-        save_forum_data(character_name, data)
-    return {'likes': post.get('likes', 0), 'liked_by_me': post.get('liked_by_me', False)}
-
-def add_forum_comment(character_name, post_id, content, author_display_name=None):
-    """为指定帖子添加一条评论。返回新评论对象。"""
-    data = load_forum_data(character_name)
-    posts = data.get('posts', [])
-    post = _find_post_by_id(posts, post_id)
-    if not post:
-        return None
-    if 'comments' not in post or not isinstance(post['comments'], list):
-        post['comments'] = []
-    now = datetime.now()
-    comment = {
-        'id': f"comment_{int(now.timestamp()*1000)}",
-        'npc_name': author_display_name or f"{character_name} 的小号",
-        'content': content,
-        'timestamp': now.strftime("%Y-%m-%d %H:%M:%S"),
-        'author': 'self'
-    }
-    post['comments'].append(comment)
-    save_forum_data(character_name, data)
-    return comment
-
-def ensure_comment_ids_in_post(post):
-    """为旧数据中的评论补充id字段"""
-    if not post or 'comments' not in post:
-        return
-    for c in post.get('comments', []):
-        if 'id' not in c:
-            # 以时间戳或随机数填补
-            c['id'] = f"comment_{int(time.time()*1000)}_{random.randint(100,999)}"
-
-def add_forum_comment_with_parent(character_name, post_id, content, author, author_display, parent_comment_id=None):
-    """为帖子添加一条评论，支持父评论。author: 'me' 或 'character'"""
-    data = load_forum_data(character_name)
-    posts = data.get('posts', [])
-    post = _find_post_by_id(posts, post_id)
-    if not post:
-        return None
-    if 'comments' not in post or not isinstance(post['comments'], list):
-        post['comments'] = []
-    ensure_comment_ids_in_post(post)
-    now = datetime.now()
-    comment = {
-        'id': f"comment_{int(now.timestamp()*1000)}",
-        'npc_name': author_display,
-        'content': content,
-        'timestamp': now.strftime("%Y-%m-%d %H:%M:%S"),
-        'author': author,  # 'me' 或 'character'
-    }
-    if parent_comment_id:
-        comment['parent_id'] = parent_comment_id
-    post['comments'].append(comment)
-    save_forum_data(character_name, data)
-    return comment
-
-def generate_character_conversation_reply(character_name, post_content, user_message):
-    """基于角色设定，生成角色对用户的回复"""
-    try:
-        config = parse_config()
-        character_prompt = load_character_prompt(character_name) or ''
-        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        prompt = f"""
-你是“{character_name}”，以下是你的角色设定：
-{character_prompt}
-
-场景：你的小号在社交平台发了一条动态，下面有一条来自用户的回复。请以你的人设与语气，回复用户的这条话。
-
-原始动态：{post_content}
-用户的话：{user_message}
-
-要求：
-1. 中文回复，口语化，贴近真实社交平台风格
-2. 35字以内，尽量一到两句
-3. 可以自然使用emoji但不要太多
-4. 直接输出回复文本，不要任何前后缀
-"""
-
-        # 优先使用论坛自定义模型
-        use_forum_custom = bool(config.get('ENABLE_FORUM_CUSTOM_MODEL', False))
-        if use_forum_custom:
-            api_key = (config.get('FORUM_API_KEY') or config.get('DEEPSEEK_API_KEY', '')).strip()
-            base_url = config.get('FORUM_BASE_URL', config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1'))
-            model = (config.get('FORUM_MODEL') or config.get('MODEL', 'deepseek-v3-0324'))
-            temperature = config.get('FORUM_TEMPERATURE', config.get('TEMPERATURE', 1.0))
-            max_tokens = min(int(config.get('FORUM_MAX_TOKEN', config.get('MAX_TOKEN', 2000))), 120)
-        else:
-            api_key = config.get('DEEPSEEK_API_KEY', '')
-            base_url = config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1')
-            model = config.get('MODEL', 'deepseek-v3-0324')
-            temperature = config.get('TEMPERATURE', 1.0)
-            max_tokens = min(config.get('MAX_TOKEN', 2000), 120)
-
-        if not api_key:
-            return "收到啦～"
-
-        client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=20)
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=20
-        )
-        reply = completion.choices[0].message.content.strip()
-        if not reply:
-            reply = "收到啦～"
-        # 基础清理
-        if reply.startswith("回复：") or reply.startswith("回复:"):
-            reply = reply.split("：", 1)[-1].split(":", 1)[-1].strip()
-        reply = reply.replace("\\", "\n").strip()
-        return reply[:100]
-    except Exception as e:
-        app.logger.error(f"生成角色会话回复失败: {e}")
-        return "了解！"
-
-def get_liked_forum_posts(character_name):
-    data = load_forum_data(character_name)
-    posts = data.get('posts', [])
-    liked = [p for p in posts if p.get('liked_by_me')]
-    # 保持与其他接口一致：按时间倒序
-    try:
-        liked.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    except Exception:
-        pass
-    return liked
-
-def get_thread_posts(character_name):
-    data = load_forum_data(character_name)
-    posts = data.get('posts', [])
-    threads = [p for p in posts if p.get('comments') and isinstance(p.get('comments'), list) and len(p.get('comments')) > 0]
-    try:
-        threads.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    except Exception:
-        pass
-    return threads
-
-@app.route('/api/forum/like/<character_name>/<post_id>', methods=['POST'])
-@login_required
-def like_forum_post(character_name, post_id):
-    """点赞/取消点赞 指定帖子。请求体可包含 like: true/false；不含则为切换。"""
-    try:
-        like_state = None
-        if request.is_json and isinstance(request.json, dict) and 'like' in request.json:
-            like_state = bool(request.json.get('like'))
-        result = toggle_like_forum_post(character_name, post_id, like_state)
-        if not result:
-            return jsonify({'error': '帖子不存在'}), 404
-        return jsonify(result)
-    except Exception as e:
-        app.logger.error(f"点赞操作失败: {e}")
-        return jsonify({'error': f'点赞失败: {str(e)}'}), 500
-
-@app.route('/api/forum/likes/<character_name>')
-@login_required
-def get_likes(character_name):
-    """获取我喜欢的帖子列表"""
-    try:
-        posts = get_liked_forum_posts(character_name)
-        return jsonify({'posts': posts})
-    except Exception as e:
-        app.logger.error(f"获取喜欢列表失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-@app.route('/api/forum/reply/<character_name>/<post_id>', methods=['POST'])
-@login_required
-def reply_to_post(character_name, post_id):
-    """对帖子进行回复（添加一条评论），并自动生成角色的AI回复"""
-    try:
-        if not request.is_json:
-            return jsonify({'error': '请求格式错误'}), 400
-        content = str(request.json.get('content', '')).strip()
-        parent_comment_id = request.json.get('parent_comment_id')
-        if not content:
-            return jsonify({'error': '回复内容不能为空'}), 400
-        if len(content) > 500:
-            return jsonify({'error': '回复内容过长（最多500字）'}), 400
-        # 加载帖子用于上下文
-        data = load_forum_data(character_name)
-        post = _find_post_by_id(data.get('posts', []), post_id)
-        if not post:
-            return jsonify({'error': '帖子不存在，无法回复'}), 404
-
-        ensure_comment_ids_in_post(post)
-
-        # 先写入用户的评论
-        my_comment = add_forum_comment_with_parent(
-            character_name=character_name,
-            post_id=post_id,
-            content=content,
-            author='me',
-            author_display='我',
-            parent_comment_id=parent_comment_id
-        )
-
-        # 生成角色AI回复
-        ai_reply_text = generate_character_conversation_reply(
-            character_name, post.get('content', ''), content
-        )
-        ai_comment = add_forum_comment_with_parent(
-            character_name=character_name,
-            post_id=post_id,
-            content=ai_reply_text,
-            author='character',
-            author_display=f"{character_name} 的小号",
-            parent_comment_id=my_comment['id']
-        )
-
-        return jsonify({'my_comment': my_comment, 'ai_comment': ai_comment})
-    except Exception as e:
-        app.logger.error(f"添加回复失败: {e}")
-        return jsonify({'error': f'添加回复失败: {str(e)}'}), 500
-
-@app.route('/api/forum/threads/<character_name>')
-@login_required
-def get_forum_threads(character_name):
-    """获取包含回复的帖子列表（用于“推文和回复”）"""
-    try:
-        posts = get_thread_posts(character_name)
-        # 为兼容旧数据，补全评论id
-        for p in posts:
-            ensure_comment_ids_in_post(p)
-        return jsonify({'posts': posts})
-    except Exception as e:
-        app.logger.error(f"获取线程列表失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-# ===== 喜欢动态（AI生成） =====
-def generate_likes_feed_items(character_name, use_online=False):
-    """生成角色会喜欢的外部博文（AI生成，最多3条）。
-    当启用联网模型时：先用联网模型检索“今日热点摘要”，再把摘要交给论坛模型（若启用）或主模型生成三条博文。
-    """
-    try:
-        config = parse_config()
-        character_prompt = load_character_prompt(character_name) or ''
-        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        # --- 阶段一：可选的联网热点检索 ---
-        online_hot_brief = ''
-        if use_online and bool(config.get('ENABLE_ONLINE_API', False)):
-            online_api_key = (config.get('ONLINE_API_KEY') or '').strip()
-            online_base_url = config.get('ONLINE_BASE_URL', 'https://vg.v1api.cc/v1')
-            online_model = config.get('ONLINE_MODEL', 'net-gpt-4o-mini')
-            online_temperature = float(config.get('ONLINE_API_TEMPERATURE', 0.7))
-            online_max_tokens = int(config.get('ONLINE_API_MAX_TOKEN', 2000))
-
-            if online_api_key:
-                try:
-                    online_prompt = (
-                        "请用简洁要点汇总'今天'中文互联网主要新闻与热点（5-8条），不要涉及政治敏感话题和政治人物"
-                        "偏向话题与趋势，不要细节长文；每条不超过30字；"
-                        "只输出纯文本多行，不要编号、不要任何额外解释。"
-                    )
-                    online_client = openai.OpenAI(base_url=online_base_url, api_key=online_api_key, timeout=20)
-                    online_completion = online_client.chat.completions.create(
-                        model=online_model,
-                        messages=[{"role": "user", "content": online_prompt}],
-                        temperature=online_temperature,
-                        max_tokens=min(online_max_tokens, 500),
-                        timeout=20
-                    )
-                    online_hot_brief = (online_completion.choices[0].message.content or '').strip()
-                    # 只保留前8行，避免上下文过长
-                    if online_hot_brief:
-                        lines_hot = [ln.strip() for ln in online_hot_brief.split('\n') if ln.strip()]
-                        online_hot_brief = "\n".join(lines_hot[:8])
-                except Exception as online_err:
-                    app.logger.warning(f"联网热点检索失败，将回退本地生成: {online_err}")
-                    online_hot_brief = ''
-
-        # --- 阶段二：用论坛模型（若启用）或主模型生成三条内容 ---
-        # 选择生成阶段所用模型
-        gen_base_url = config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1')
-        gen_model = config.get('MODEL', 'deepseek-v3-0324')
-        gen_api_key = (config.get('DEEPSEEK_API_KEY', '')).strip()
-        gen_temperature = float(config.get('TEMPERATURE', 1.0))
-        gen_max_tokens = min(int(config.get('MAX_TOKEN', 2000)), 400)
-
-        if bool(config.get('ENABLE_FORUM_CUSTOM_MODEL', False)):
-            gen_base_url = config.get('FORUM_BASE_URL', gen_base_url)
-            gen_model = (config.get('FORUM_MODEL') or gen_model)
-            gen_api_key = (config.get('FORUM_API_KEY') or gen_api_key).strip()
-            gen_temperature = float(config.get('FORUM_TEMPERATURE', gen_temperature))
-            gen_max_tokens = min(int(config.get('FORUM_MAX_TOKEN', gen_max_tokens)), 400)
-
-        if not gen_api_key:
-            # 无可用key，返回一些占位
-            return [
-                {'author': '热榜·话题', 'content': '今天的小确幸：晚霞好看到想停下脚步 #日常', 'timestamp': time_str},
-                {'author': '城市·夜跑', 'content': '月亮今晚很好看，风也温柔，继续跑下去吧', 'timestamp': time_str},
-            ]
-
-        # 组合最终生成提示词
-        if online_hot_brief:
-            final_prompt = f"""
-你在做内容聚合，给角色“{character_name}”挑选他会喜欢的3条中文博文（每条不超过60字）。
-角色设定：
-{character_prompt}
-
-今日热点（仅作参考，避免机械复述，可融合相关话题与氛围）：
-{online_hot_brief}
-
-请严格按以下要求输出：
-1) 仅输出三行内容，不要任何额外说明或序号
-2) 每行格式：作者名 - 文本内容（可含#话题）
-3) 不要使用反斜线 \\, 不要用 \n 或 \\ 分隔，直接正常标点与空格
-4) 不要使用引号或代码块
-"""
-        else:
-            final_prompt = f"""
-你在做内容聚合，给角色“{character_name}”挑选他会喜欢的3条中文博文（每条不超过60字）。
-角色设定：
-{character_prompt}
-
-如果具备联网能力，请结合当日热门趋势或资讯做简洁融合；否则输出贴合其性格与日常审美的生活化内容。
-
-请严格按以下要求输出：
-1) 仅输出三行内容，不要任何额外说明或序号
-2) 每行格式：作者名 - 文本内容（可含#话题）
-3) 不要使用反斜线 \\, 不要用 \n 或 \\ 分隔，直接正常标点与空格
-4) 不要使用引号或代码块
-"""
-
-        gen_client = openai.OpenAI(base_url=gen_base_url, api_key=gen_api_key, timeout=25)
-        gen_completion = gen_client.chat.completions.create(
-            model=gen_model,
-            messages=[{"role": "user", "content": final_prompt}],
-            temperature=gen_temperature,
-            max_tokens=gen_max_tokens,
-            timeout=25
-        )
-        reply = (gen_completion.choices[0].message.content or '').strip()
-
-        lines = [ln.strip() for ln in reply.split('\n') if ln.strip()]
-        items = []
-        for ln in lines[:3]:
-            # 解析“作者 - 内容”
-            if ' - ' in ln:
-                author, content = ln.split(' - ', 1)
-            elif '-' in ln:
-                author, content = ln.split('-', 1)
-            else:
-                author, content = '博主', ln
-            # 清理反斜线，保持单行
-            safe_content = content.replace('\\', '').strip()
-            items.append({
-                'author': author.strip()[:20],
-                'content': safe_content,
-                'timestamp': time_str,
-                'likes': random.randint(20, 500),
-                'replies': random.randint(0, 120)
-            })
-        if not items:
-            items = [{
-                'author': '博主',
-                'content': reply.replace('\\', '')[:60],
-                'timestamp': time_str,
-                'likes': random.randint(20, 500),
-                'replies': random.randint(0, 120)
-            }]
-        return items
-    except Exception as e:
-        app.logger.error(f"生成喜欢Feed失败: {e}")
-        return []
-
-@app.route('/api/forum/likes_feed/<character_name>')
-@login_required
-def get_likes_feed(character_name):
-    try:
-        data = load_forum_data(character_name)
-        feed = data.get('liked_feed', [])
-        # 补齐缺失的统计字段，便于老数据兼容
-        changed = False
-        for it in feed:
-            if 'likes' not in it:
-                it['likes'] = random.randint(20, 500)
-                changed = True
-            if 'replies' not in it:
-                it['replies'] = random.randint(0, 120)
-                changed = True
-        if changed:
-            save_forum_data(character_name, data)
-        # 倒序（最新在前）
-        try:
-            feed.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        except Exception:
-            pass
-        return jsonify({'items': feed})
-    except Exception as e:
-        app.logger.error(f"获取喜欢Feed失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-@app.route('/api/forum/refresh_likes/<character_name>', methods=['POST'])
-@login_required
-def refresh_likes_feed(character_name):
-    try:
-        config = parse_config()
-        use_online = bool(config.get('ENABLE_ONLINE_API', False))
-        items = generate_likes_feed_items(character_name, use_online=use_online)
-        if not items:
-            return jsonify({'has_new_content': False, 'message': '暂时没有新的喜欢'}), 200
-        # 存储
-        data = load_forum_data(character_name)
-        if 'liked_feed' not in data or not isinstance(data['liked_feed'], list):
-            data['liked_feed'] = []
-        now_ts = int(time.time()*1000)
-        for idx, it in enumerate(items):
-            it['id'] = f"liked_{now_ts}_{idx}"
-            if 'likes' not in it:
-                it['likes'] = random.randint(20, 500)
-            if 'replies' not in it:
-                it['replies'] = random.randint(0, 120)
-            data['liked_feed'].append(it)
-        save_forum_data(character_name, data)
-        return jsonify({'has_new_content': True, 'items': items})
-    except Exception as e:
-        app.logger.error(f"刷新喜欢Feed失败: {e}")
-        return jsonify({'error': f'刷新失败: {str(e)}'}), 500
-
-@app.route('/api/forum/likes_feed/<character_name>/<item_id>', methods=['DELETE'])
-@login_required
-def delete_likes_feed_item(character_name, item_id):
-    """删除AI生成的喜欢Feed中的一项，不影响论坛原帖"""
-    try:
-        data = load_forum_data(character_name)
-        feed = data.get('liked_feed', [])
-        original_len = len(feed)
-        feed = [it for it in feed if str(it.get('id')) != str(item_id)]
-        if len(feed) == original_len:
-            return jsonify({'error': '未找到该喜欢项'}), 404
-        data['liked_feed'] = feed
-        save_forum_data(character_name, data)
-        return jsonify({'message': '已移除'}), 200
-    except Exception as e:
-        app.logger.error(f"删除喜欢Feed项失败: {e}")
-        return jsonify({'error': f'删除失败: {str(e)}'}), 500
-
-# ===== 头像管理API =====
-@app.route('/api/forum/avatar/upload/<character_name>', methods=['POST'])
-@login_required
-def upload_avatar(character_name):
-    """上传角色头像"""
-    try:
-        # 验证角色名
-        config = parse_config()
-        listen_list = config.get('LISTEN_LIST', [])
-        character_found = False
-        for item in listen_list:
-            if len(item) >= 2 and item[1] == character_name:
-                character_found = True
-                break
-        
-        if not character_found:
-            return jsonify({'error': '角色不存在'}), 404
-        
-        if 'avatar' not in request.files:
-            return jsonify({'error': '没有上传文件'}), 400
-        
-        file = request.files['avatar']
-        if file.filename == '':
-            return jsonify({'error': '没有选择文件'}), 400
-        
-        if not allowed_avatar_file(file.filename):
-            return jsonify({'error': '不支持的文件格式，请上传PNG、JPG、JPEG、GIF或WebP格式的图片'}), 400
-        
-        # 删除旧的头像文件
-        old_avatar_path = get_avatar_file_path(character_name)
-        if old_avatar_path and os.path.exists(old_avatar_path):
-            try:
-                os.remove(old_avatar_path)
-                app.logger.info(f"删除旧头像文件: {old_avatar_path}")
-            except Exception as e:
-                app.logger.warning(f"删除旧头像文件失败: {e}")
-        
-        # 保存新的头像文件
-        file_extension = file.filename.rsplit('.', 1)[1].lower()
-        filename = get_avatar_filename(character_name, file_extension)
-        filepath = os.path.join(FORUM_AVATAR_DIR, filename)
-        
-        file.save(filepath)
-        app.logger.info(f"头像上传成功: {filepath}")
-        
-        return jsonify({
-            'message': '头像上传成功',
-            'filename': filename
-        })
-    
-    except Exception as e:
-        app.logger.error(f"头像上传失败: {e}")
-        return jsonify({'error': f'上传失败: {str(e)}'}), 500
-
-@app.route('/api/forum/avatar/<character_name>')
-@login_required
-def get_avatar(character_name):
-    """获取角色头像"""
-    try:
-        avatar_path = get_avatar_file_path(character_name)
-        if not avatar_path:
-            return jsonify({'error': '头像不存在'}), 404
-        
-        return send_file(avatar_path)
-    
-    except Exception as e:
-        app.logger.error(f"获取头像失败: {e}")
-        return jsonify({'error': f'获取失败: {str(e)}'}), 500
-
-@app.route('/api/forum/avatar/<character_name>', methods=['DELETE'])
-@login_required
-def delete_avatar(character_name):
-    """删除角色头像"""
-    try:
-        # 验证角色名
-        config = parse_config()
-        listen_list = config.get('LISTEN_LIST', [])
-        character_found = False
-        for item in listen_list:
-            if len(item) >= 2 and item[1] == character_name:
-                character_found = True
-                break
-        
-        if not character_found:
-            return jsonify({'error': '角色不存在'}), 404
-        
-        avatar_path = get_avatar_file_path(character_name)
-        if not avatar_path:
-            return jsonify({'error': '头像不存在'}), 404
-        
-        os.remove(avatar_path)
-        app.logger.info(f"头像删除成功: {avatar_path}")
-        
-        return jsonify({'message': '头像删除成功'})
-    
-    except Exception as e:
-        app.logger.error(f"头像删除失败: {e}")
-        return jsonify({'error': f'删除失败: {str(e)}'}), 500
-
-def add_forum_post(character_name, content):
-    """添加新的论坛帖子"""
-    try:
-        forum_file = _forum_file_path(character_name)
-        
-        # 读取现有数据
-        if os.path.exists(forum_file):
-            with open(forum_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        else:
-            data = {'posts': [], 'npcs': []}
-        
-        # 创建新帖子
-        now = datetime.now()
-        new_post = {
-            'id': f"post_{int(now.timestamp())}",
-            'content': content,
-            'timestamp': now.strftime("%Y-%m-%d %H:%M:%S"),
-            'likes': random.randint(5, 50),
-            'comments': []
-        }
-        
-        # 生成NPC评论：在生成函数内部对每个NPC进行独立概率判定
-        npc_comments = generate_npc_comments(character_name, content)
-        new_post['comments'] = npc_comments
-        
-        # 添加到数据中
-        data['posts'].append(new_post)
-        
-        # 保持最多100条帖子
-        if len(data['posts']) > 100:
-            data['posts'] = data['posts'][-100:]
-        
-        # 保存数据
-        with open(forum_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        return new_post
-    
-    except Exception as e:
-        app.logger.error(f"添加论坛帖子失败: {e}")
-        return None
-
-def generate_npc_comments(character_name, post_content):
-    """生成NPC评论 - 基于用户配置的NPC设定和回复风格"""
-    try:
-        # 从角色设定中提取可能的NPC名单
-        character_prompt = load_character_prompt(character_name)
-        
-        # 尝试从角色设定中提取人物名称
-        extracted_names = []
-        if character_prompt:
-            import re
-            # 查找可能的人名（中文姓名模式）
-            name_patterns = [
-                r'([小]\w{1,2})',  # 小桃、小明等
-                r'([李王张刘陈杨黄赵吴周徐孙朱马胡郭何高林罗郑梁谢宋唐许邓冯韩曹曾彭肖蔡潘田董袁于余叶蒋杜苏魏程吕丁沈任姚卢姜崔钟谭陆汪范金石廖贾夏韦傅方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤]\w{1,2})',  # 常见姓氏
-                r'(\w{2,3}(?:同学|朋友|室友|同事))',  # XX同学、XX朋友等
-            ]
-            
-            for pattern in name_patterns:
-                matches = re.findall(pattern, character_prompt)
-                extracted_names.extend(matches)
-        
-
-        # 合并名单，优先使用从角色设定中提取的名称
-        all_names = list(set(extracted_names ))
-        
-        # 尝试读取用户配置的NPC设定
-        npc_config = load_npc_config()
-        configured_npcs = []
-        
-        if npc_config and 'selected_npcs' in npc_config:
-            for npc_name in npc_config['selected_npcs']:
-                if npc_name in npc_config.get('npc_settings', {}):
-                    npc_settings = npc_config['npc_settings'][npc_name]
-                    configured_npcs.append({
-                        'name': npc_name,
-                        'settings': npc_settings
-                    })
-        
-        # 只使用用户配置的NPC生成智能回复
-        if configured_npcs:
-            app.logger.info(f"使用配置的NPC生成智能回复: {[npc['name'] for npc in configured_npcs]}")
-            return generate_configured_npc_comments(configured_npcs, post_content, character_name)
-        
-        # 如果没有配置NPC，返回空列表
-        app.logger.info("未配置NPC，不生成评论")
-        return []
-        
-    except Exception as e:
-        app.logger.error(f"生成NPC评论失败: {e}")
-        return []
-
-def generate_configured_npc_comments(configured_npcs, post_content, character_name):
-    """基于用户配置生成智能NPC评论（逐条串行，每个NPC独立60%概率）"""
-    try:
-        comments = []
-        reply_probability = 0.6  # 每个NPC独立回复概率
-
-        # 逐条串行生成，避免并行导致的潜在超时/限速问题
-        for npc in configured_npcs:
-            # 概率判定：每个NPC独立60%概率回复
-            if random.random() >= reply_probability:
-                continue
-
-            npc_name = npc['name']
-            npc_settings = npc['settings']
-
-            # 基于配置生成智能回复（串行调用）
-            comment_text = generate_smart_npc_reply(
-                npc_name,
-                npc_settings,
-                post_content,
-                character_name
-            )
-
-            if comment_text:
-                # 随机延迟时间
-                base_time = datetime.now()
-                delay_minutes = random.randint(2, 120)  # 2分钟到2小时
-                comment_time = base_time + timedelta(minutes=delay_minutes)
-
-                comments.append({
-                    'npc_name': npc_name,
-                    'content': comment_text,
-                    'timestamp': comment_time.strftime("%Y-%m-%d %H:%M:%S")
-                })
-
-        return comments
-
-    except Exception as e:
-        app.logger.error(f"生成配置NPC评论失败: {e}")
-        return []
-
-def generate_smart_npc_reply(npc_name, npc_settings, post_content, character_name):
-    """基于NPC配置生成智能回复"""
-    try:
-        # 构建AI提示词
-        language_style = npc_settings.get('language_style', 'casual')
-        relationship = npc_settings.get('relationship', 'friend')
-        example_output = npc_settings.get('example_output', '')
-        other_settings = npc_settings.get('other_settings', '')
-        
-        # 语言风格映射
-        style_descriptions = {
-            'formal': '正式、礼貌、得体',
-            'casual': '随意、轻松、日常',
-            'friendly': '友好、温暖、亲切',
-            'professional': '专业、严谨、有见地',
-            'humorous': '幽默、有趣、轻松',
-            'serious': '严肃、认真、深思熟虑'
-        }
-        
-        # 关系映射
-        relationship_descriptions = {
-            'friend': '朋友关系，可以开玩笑、分享感受',
-            'colleague': '同事关系，保持专业但友好',
-            'family': '家人关系，关心、温暖、支持',
-            'stranger': '陌生人关系，礼貌、适度',
-            'student': '学生关系，学习、请教、尊重'
-        }
-        
-        prompt = f"""
-你是一个名为"{npc_name}"的NPC，正在回复"{character_name}"的社交动态。
-
-NPC设定：
-- 语言风格：{style_descriptions.get(language_style, '随意')}
-- 与{character_name}的关系：{relationship_descriptions.get(relationship, '朋友')}
-- 示例回复风格：{example_output if example_output else '根据语言风格和关系自然回复'}
-- 其他要求：{other_settings if other_settings else '无特殊要求'}
-
-{character_name}的动态内容：
-{post_content}
-
-请根据你的NPC设定，生成一条符合你性格和关系的回复。要求：
-1. 回复要自然、真实，符合你的语言风格
-2. 体现你与{character_name}的关系
-3. 回复长度适中,20字以内
-4. 可以表达共鸣、关心、建议等情感
-5. 不要过于复杂或冗长
-6. 此次输出按一句或者一段话话，正常标点符号，不需要加反斜线
-7. 如果人物比较活泼，可以适当跟据氛围加入emoji如😥🤣👂👍👎👊👏👌👍👎👊👏👌
-
-直接输出回复内容，不需要引号或其他格式。
-"""
-        
-        # 根据配置选择论坛自定义模型或主模型
-        try:
-            config = parse_config()
-            use_forum_custom = bool(config.get('ENABLE_FORUM_CUSTOM_MODEL', False))
-
-            if use_forum_custom:
-                api_key = (config.get('FORUM_API_KEY') or config.get('DEEPSEEK_API_KEY', '')).strip()
-                base_url = config.get('FORUM_BASE_URL', config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1'))
-                model = (config.get('FORUM_MODEL') or config.get('MODEL', 'deepseek-v3-0324'))
-                temperature = config.get('FORUM_TEMPERATURE', config.get('TEMPERATURE', 1.1))
-                max_tokens = config.get('FORUM_MAX_TOKEN', config.get('MAX_TOKEN', 2000))
-            else:
-                api_key = config.get('DEEPSEEK_API_KEY', '')
-                base_url = config.get('DEEPSEEK_BASE_URL', 'https://vg.v1api.cc/v1')
-                model = config.get('MODEL', 'deepseek-v3-0324')
-                temperature = config.get('TEMPERATURE', 1.1)
-                max_tokens = config.get('MAX_TOKEN', 2000)
-        except Exception as e:
-            app.logger.error(f"获取模型配置失败: {e}")
-            return generate_fallback_reply(npc_name, language_style, relationship)
-        
-        if not api_key:
-            app.logger.warning(f"API密钥未配置，使用默认回复")
-            return generate_fallback_reply(npc_name, language_style, relationship)
-        
-        client = openai.OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=30  # 提高超时阈值，减少长尾超时
-        )
-        
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }],
-            temperature=temperature,
-            max_tokens=min(max_tokens, 120),  # 按20字回复需求收紧，降低超时概率
-            timeout=30
-        )
-        
-        reply = completion.choices[0].message.content.strip()
-        
-        # 清理回复内容
-        if reply and len(reply) > 3:
-            # 移除可能的格式标记
-            reply = reply.replace('"', '').replace('"', '').replace(''', '').replace(''', '')
-            reply = reply.replace('回复：', '').replace('回复:', '').replace('NPC回复：', '').replace('NPC回复:', '')
-            
-            # 自动替换反斜线为换行符
-            reply = reply.replace("\\", "\n")
-            
-            reply = reply.strip()
-            
-            if len(reply) > 3:
-                return reply
-        
-        # 如果AI回复失败，使用备用回复
-        return generate_fallback_reply(npc_name, language_style, relationship)
-        
-    except Exception as e:
-        app.logger.error(f"生成智能NPC回复失败: {e}")
-        return generate_fallback_reply(npc_name, 'casual', 'friend')
-
-def generate_fallback_reply(npc_name, language_style, relationship):
-    """生成备用回复（当AI调用失败时使用）"""
-    try:
-        # 基于语言风格和关系的备用回复模板
-        fallback_templates = {
-            'formal': {
-                'friend': ['确实如此', '我理解你的感受', '说得很有道理'],
-                'colleague': ['这个观点不错', '值得思考', '有见地'],
-                'family': ['我支持你', '相信你能行', '为你感到骄傲'],
-                'stranger': ['很有意思', '谢谢分享', '学到了'],
-                'mentor': ['很好的想法', '继续努力', '保持这种状态'],
-                'student': ['学到了', '谢谢指导', '我会努力的']
-            },
-            'casual': {
-                'friend': ['哈哈哈哈哈', '这个我懂', '真实', '好可爱wwww'],
-                'colleague': ['赞同', '同感+1', '确实如此', '支持'],
-                'family': ['加油鸭', '支持！', '理解理解', '这就是你'],
-                'stranger': ['有意思', '谢谢分享', '学到了', '不错'],
-                'mentor': ['很好', '继续', '保持', '不错'],
-                'student': ['谢谢', '学到了', '好的', '明白']
-            },
-            'friendly': {
-                'friend': ['好可爱wwww', '理解理解', '加油鸭', '支持！'],
-                'colleague': ['赞同', '同感+1', '确实如此', '支持'],
-                'family': ['我支持你', '相信你能行', '为你感到骄傲'],
-                'stranger': ['很有意思', '谢谢分享', '学到了'],
-                'mentor': ['很好的想法', '继续努力', '保持这种状态'],
-                'student': ['学到了', '谢谢指导', '我会努力的']
-            }
-        }
-        
-        # 获取对应的模板
-        templates = fallback_templates.get(language_style, fallback_templates['casual'])
-        relationship_templates = templates.get(relationship, templates['friend'])
-        
-        # 随机选择回复
-        return random.choice(relationship_templates)
-        
-    except Exception as e:
-        app.logger.error(f"生成备用回复失败: {e}")
-        return "赞同"
-
-
-
-def load_npc_config():
-    """从配置文件加载NPC配置"""
-    try:
-        npc_config_file = _npc_config_file_path()
-        
-        if not os.path.exists(npc_config_file):
-            app.logger.info("NPC配置文件不存在")
-            return None
-        
-        with open(npc_config_file, 'r', encoding='utf-8') as f:
-            config_data = json.load(f)
-        
-        # 确保配置格式完整
-        if 'selected_npcs' not in config_data:
-            config_data['selected_npcs'] = []
-        if 'npc_settings' not in config_data:
-            config_data['npc_settings'] = {}
-        
-        # 为每个选中的NPC确保有默认设置
-        for npc_name in config_data.get('selected_npcs', []):
-            if npc_name not in config_data.get('npc_settings', {}):
-                config_data['npc_settings'][npc_name] = {
-                    'language_style': 'casual',
-                    'relationship': 'friend',
-                    'example_output': '',
-                    'other_settings': ''
-                }
-                app.logger.info(f"为NPC {npc_name} 添加默认设置")
-            else:
-                app.logger.info(f"NPC {npc_name} 保持原有设置")
-        
-        app.logger.info(f"成功加载NPC配置: {config_data}")
-        return config_data
-        
-    except Exception as e:
-        app.logger.error(f"加载NPC配置失败: {e}")
-        return None
-
 def get_default_config():
-    return {
-        "LISTEN_LIST": [['微信名1', '角色1']],
-        "DEEPSEEK_API_KEY": '',
-        "DEEPSEEK_BASE_URL": 'https://vg.v1api.cc/v1',
-        "MODEL": 'deepseek-v3-0324',
-        "MAX_GROUPS": 5,
-        "MAX_TOKEN": 2000,
-        "TEMPERATURE": 1.1,
-        "MOONSHOT_API_KEY": '',
-        "MOONSHOT_BASE_URL": 'https://vg.v1api.cc/v1',
-        "MOONSHOT_MODEL": 'gpt-4o',
-        "MOONSHOT_TEMPERATURE": 0.8,
-        "ENABLE_IMAGE_RECOGNITION": True,
-        "ENABLE_EMOJI_RECOGNITION": True,
-        "QUEUE_WAITING_TIME": 7,
-        "EMOJI_DIR": 'emojis',
-        "ENABLE_EMOJI_SENDING": True,
-        "EMOJI_SENDING_PROBABILITY": 25,
-        "AUTO_MESSAGE": '请你模拟系统设置的角色，在微信上找对方继续刚刚的话题或者询问对方在做什么',
-        "ENABLE_AUTO_MESSAGE": True,
-        "MIN_COUNTDOWN_HOURS": 1.0,
-        "MAX_COUNTDOWN_HOURS": 2.0,
-        "QUIET_TIME_START": '22:00',
-        "QUIET_TIME_END": '8:00',
-        "AVERAGE_TYPING_SPEED": 0.2,
-        "RANDOM_TYPING_SPEED_MIN": 0.05,
-        "RANDOM_TYPING_SPEED_MAX": 0.1,
-        "SEPARATE_ROW_SYMBOLS": True,
-        "ENABLE_MEMORY": True,
-        "MEMORY_TEMP_DIR": 'Memory_Temp',
-        "MAX_MESSAGE_LOG_ENTRIES": 30,
-        "MAX_MEMORY_NUMBER": 50,
-        "UPLOAD_MEMORY_TO_AI": True,
-        "ACCEPT_ALL_GROUP_CHAT_MESSAGES": False,
-        "ENABLE_GROUP_AT_REPLY": True,
-        "ENABLE_GROUP_KEYWORD_REPLY": False,
-        "GROUP_KEYWORD_LIST": ['你好', '机器人', '在吗'],
-        "GROUP_CHAT_RESPONSE_PROBABILITY": 100,
-        "GROUP_KEYWORD_REPLY_IGNORE_PROBABILITY": True,
-        "ENABLE_LOGIN_PASSWORD": False,
-        "LOGIN_PASSWORD": '123456',
-        "PORT": 5000,
-        "ENABLE_REMINDERS": True,
-        "ALLOW_REMINDERS_IN_QUIET_TIME": True,
-        "USE_VOICE_CALL_FOR_REMINDERS": False,
-        "ENABLE_ONLINE_API": False,
-        "ONLINE_BASE_URL": 'https://vg.v1api.cc/v1',
-        "ONLINE_MODEL": 'net-gpt-4o-mini',
-        "ONLINE_API_KEY": '',
-        "ONLINE_API_TEMPERATURE": 0.7,
-        "ONLINE_API_MAX_TOKEN": 2000,
-        "SEARCH_DETECTION_PROMPT": '是否需要查询今天的天气、最新的新闻事件、特定网站的内容、股票价格、特定人物的最新动态等',
-        "ONLINE_FIXED_PROMPT": '',
-        "ENABLE_URL_FETCHING": True,
-        "REQUESTS_TIMEOUT": 10,
-        "REQUESTS_USER_AGENT": 'Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Mobile Safari/537.36',
-        "MAX_WEB_CONTENT_LENGTH": 2000,
-        "ENABLE_SCHEDULED_RESTART": True,
-        "RESTART_INTERVAL_HOURS": 2.0,
-        "RESTART_INACTIVITY_MINUTES": 15,
-        "REMOVE_PARENTHESES": False,
-        "ENABLE_ASSISTANT_MODEL": False,
-        "ASSISTANT_BASE_URL": 'https://vg.v1api.cc/v1',
-        "ASSISTANT_MODEL": 'gpt-4o-mini',
-        "ASSISTANT_API_KEY": '',
-        "ASSISTANT_TEMPERATURE": 0.3,
-        "ASSISTANT_MAX_TOKEN": 1000,
-        "USE_ASSISTANT_FOR_MEMORY_SUMMARY": False,
-        "IGNORE_GROUP_CHAT_FOR_AUTO_MESSAGE": False,
-        "ENABLE_SENSITIVE_CONTENT_CLEARING": True,
-        "SAVE_MEMORY_TO_SEPARATE_FILE": True,
-        "CORE_MEMORY_DIR": 'CoreMemory',
-        "ENABLE_TEXT_COMMANDS": True,
-        "ENABLE_FORUM_CUSTOM_MODEL": False,
-        "FORUM_BASE_URL": 'https://vg.v1api.cc/v1',
-        "FORUM_MODEL": '',
-        "FORUM_API_KEY": '',
-        "FORUM_TEMPERATURE": 1.0,
-        "FORUM_MAX_TOKEN": 1200
-    }
+    return structured_default_config()
 
 def validate_config():
-    """验证config.py配置完整性，若有缺失项则自动补充默认值"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, 'config.py')
-    
+    """确保本地结构化配置存在，并补齐缺失字段。"""
     try:
-        # 如果配置文件不存在，直接创建完整配置
-        if not os.path.exists(config_path):
-            print(f"配置文件不存在，正在创建新配置文件: {config_path}")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write("# -*- coding: utf-8 -*-\n\n")
-                f.write("# 自动生成的配置文件\n\n")
-                
-                for key, value in get_default_config().items():
-                    f.write(f"{key} = {repr(value)}\n")
-            print("已创建新的配置文件")
-            return True
-        
-        # 尝试解析当前配置
-        current_config = parse_config()
-        default_config = get_default_config()
-        
-        # 记录缺少的配置项
-        missing_keys = []
-        # 构建需要更新的配置字典
-        updates_needed = {}
-        
-        # 检查每个默认配置项是否存在
-        for key, default_value in default_config.items():
-            if key not in current_config:
-                missing_keys.append(key)
-                updates_needed[key] = default_value
-        
-        # 如果存在缺失项，更新配置文件
-        if missing_keys:
-            print(f"检测到{len(missing_keys)}个缺失的配置项: {', '.join(missing_keys)}")
-            print("正在自动补充默认值...")
-            
-            # 直接修改文件，添加缺失的配置项
-            with open(config_path, 'a', encoding='utf-8') as f:
-                f.write("\n# 自动补充的配置项\n")
-                for key in missing_keys:
-                    f.write(f"{key} = {repr(default_config[key])}\n")
-            
-            print("配置文件已更新完成")
-            return True  # 配置已更新
-        
-        print("配置文件验证完成，所有配置项齐全")
-        return False  # 配置无需更新
-        
+        cfg = load_structured_config()
+        issues = validate_structured_config(cfg)
+        missing = [item for item in issues if item.get("code") == "MISSING"]
+        if missing:
+            print(f"检测到{len(missing)}个缺失的配置项，已用默认值补齐")
+            save_structured_config({})
+        else:
+            print("配置文件验证完成，所有配置项齐全")
+        return bool(missing)
     except Exception as e:
         print(f"验证配置文件时出错: {str(e)}")
         return False
-def delete_forum_post_by_id(character_name, post_id):
-    """根据ID删除角色的论坛帖子"""
-    try:
-        forum_file = _forum_file_path(character_name)
-        
-        if not os.path.exists(forum_file):
-            app.logger.warning(f"论坛数据文件不存在: {forum_file}")
-            return False
-        
-        # 读取现有数据
-        with open(forum_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        posts = data.get('posts', [])
-        
-        # 查找并删除指定ID的帖子
-        original_count = len(posts)
-        posts = [post for post in posts if post.get('id') != post_id]
-        
-        if len(posts) == original_count:
-            app.logger.warning(f"未找到要删除的帖子: {post_id}")
-            return False
-        
-        # 更新数据
-        data['posts'] = posts
-        
-        # 保存数据
-        with open(forum_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        app.logger.info(f"成功删除帖子 {post_id}，剩余帖子数量: {len(posts)}")
-        return True
-        
-    except Exception as e:
-        app.logger.error(f"删除论坛帖子失败: {e}")
-        return False
+
+
+from forum_routes import forum_bp
+app.register_blueprint(forum_bp)
+from webui_data import register_data_routes
+register_data_routes(app, login_required, sys.modules[__name__])
+from operations_routes import register_operations_routes
+register_operations_routes(app, login_required, BASE_DIR)
+from operations_action_routes import register_operations_action_routes
+register_operations_action_routes(app, login_required, BASE_DIR)
 
 def kill_process_using_port(port):
     """
-    检查指定端口是否被占用，如果被占用则结束占用的进程
+    检查指定端口是否被占用。
+    仅结束本项目自己的历史 WebUI 进程；若是无关进程则提示冲突并退出，不误杀。
     """
-    # 遍历所有连接
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        print(f"无效端口: {port}")
+        return
+
+    current_pid = os.getpid()
+    project_dir = os.path.abspath(os.path.dirname(__file__))
+
     for conn in psutil.net_connections():
-        # 由于 config 中 PORT 可能为字符串，转换为 int
-        if conn.laddr and conn.laddr.port == port:
-            # 根据不同平台，监听状态可能不同（Linux一般为 'LISTEN'，Windows为 'LISTENING'）
-            if conn.status in ('LISTEN', 'LISTENING'):
-                try:
-                    proc = psutil.Process(conn.pid)
-                    print(f"检测到端口 {port} 被进程 {conn.pid} 占用，尝试结束该进程……")
-                    proc.kill()
-                    proc.wait(timeout=3)
-                    print(f"进程 {conn.pid} 已被成功结束。")
-                except Exception as e:
-                    print(f"结束进程 {conn.pid} 时出现异常：{e}")
+        if not conn.laddr or conn.laddr.port != port:
+            continue
+        if conn.status not in ('LISTEN', 'LISTENING'):
+            continue
+        if not conn.pid or conn.pid == current_pid:
+            continue
+        try:
+            proc = psutil.Process(conn.pid)
+            cmdline = ' '.join(proc.cmdline() or [])
+            exe = proc.exe() or ''
+            try:
+                cwd = proc.cwd() or ''
+            except Exception:
+                cwd = ''
+            haystack = f"{cmdline} {exe} {cwd}".lower()
+            is_self = project_dir.lower() in haystack and (
+                'config_editor.py' in haystack or 'config_editor.exe' in haystack
+            )
+            if is_self:
+                print(f"检测到端口 {port} 被本项目历史进程 {conn.pid} 占用，尝试结束该进程……")
+                proc.kill()
+                proc.wait(timeout=3)
+                print(f"进程 {conn.pid} 已被成功结束。")
+            else:
+                print(f"\033[31m端口 {port} 已被其他进程占用，未执行结束操作。\033[0m")
+                print(f"  PID: {conn.pid}")
+                print(f"  名称: {proc.name()}")
+                print(f"  命令: {cmdline or exe}")
+                print("请关闭该程序，或在 config.py 中修改 PORT 后重试。")
+                sys.exit(1)
+        except psutil.NoSuchProcess:
+            continue
+        except Exception as e:
+            print(f"检查端口 {port} 占用进程时出现异常：{e}")
 
 if __name__ == '__main__':
     # 配置应用日志级别
@@ -3752,13 +2131,6 @@ if __name__ == '__main__':
 
     # 验证配置文件完整性
     validate_config()
-
-
-    # 配置文件存在检查
-    config_path = os.path.join(os.path.dirname(__file__), 'config.py')
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"核心配置文件缺失: {config_path}")
-    
     config = parse_config()
     PORT = config.get('PORT', '5000')
 
@@ -3766,26 +2138,20 @@ if __name__ == '__main__':
     kill_process_using_port(PORT)
 
     print("\033[32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
-    print("\033[32m✅ 配置编辑器启动成功！\033[0m")
-    print("\033[32m✅ 当前版本为：version：2.2.4\033[0m")
-    print("\033[32m⚠️ 请注意PC端微信\033[0m")
-    print("\033[32m🈲 禁止登录新注册小号，极大几率封号\033[0m")
-    print("\033[32m☣️ 买来你就被骗了，倒卖死全家喔\033[0m")
+    print("\033[32m企业智能助手管理平台已启动\033[0m")
     print("\033[32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
     print("")
-    print(f"\033[36m📡 访问地址: http://localhost:{config.get('PORT', '5000')}/\033[0m")
-    print("\033[90m   → 浏览器将自动打开，如未打开请手动访问上述地址\033[0m")
+    print(f"\033[36m访问地址: http://localhost:{config.get('PORT', '5000')}/\033[0m")
+    print("\033[90m   浏览器将自动打开；如未打开请手动访问上述地址\033[0m")
     if config.get('ENABLE_LOGIN_PASSWORD', False):
         print("")
-        print(f"\033[33m🔐 登录密码: {config.get('LOGIN_PASSWORD', '未设置')}\033[0m")
-        print("\033[90m   → 请妥善保管，勿泄露给他人\033[0m")
+        print("\033[33m已启用登录保护\033[0m")
+        print("\033[90m   请使用系统设置中配置的访问密码登录\033[0m")
     print("")
-    print("\033[33m💡 常见问题：\033[0m")
-    print("\033[90m   问题1: 点击Start Bot没反应，提示微信窗口找不到\033[0m")
-    print("\033[90m        → 解决: 重启一次微信\033[0m")
-    print("")
-    print("\033[90m   问题2: 导入配置后出现404心跳报错日志\033[0m")
-    print("\033[90m        → 解决: 重启一次桌面上的启动机器人.bat\033[0m")
+    print("\033[33m使用提示：\033[0m")
+    print("\033[90m   1. 请先确认微信客户端已登录，再在页面中启动机器人\033[0m")
+    print("\033[90m   2. 如出现循环发送，请立即点击「紧急停止」\033[0m")
+    print("\033[90m   3. 配置修改后需先停止机器人再保存\033[0m")
     print("")
     print("\033[32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
     
@@ -3797,5 +2163,7 @@ if __name__ == '__main__':
 
     # 根据配置决定绑定地址
     #host = "0.0.0.0" if config.get('ENABLE_LOGIN_PASSWORD', False) else "127.0.0.1"
-    app.run(host= "127.0.0.1", debug=False, port=PORT)
+    ignore_sigbreak_in_webui()
+    app.logger.info("WEB_PID = %s", webui_pid())
+    app.run(host= "127.0.0.1", debug=False, port=PORT, threaded=True, use_reloader=False)
     

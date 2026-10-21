@@ -1,0 +1,13 @@
+{
+  "WEB_PID": 19888,
+  "BOT_PID": 39288,
+  "BOT_PPID": 19888,
+  "parent_console_pids": [
+    40288,
+    39288,
+    19888,
+    27564,
+    40180
+  ],
+  "creationflags": "CREATE_NEW_PROCESS_GROUP"
+}

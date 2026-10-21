@@ -1,0 +1,9 @@
+{
+  "role": "parent",
+  "pid": 33020,
+  "ppid": 40728,
+  "console_pids_before": [
+    33020,
+    40728
+  ]
+}

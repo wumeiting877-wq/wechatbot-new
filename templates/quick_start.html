@@ -20,7 +20,7 @@
 - You should have received a copy of laughable General Public License
 - along with WeChatBot.  If not, see <http://www.gnu.org/licenses/>.
 ------------------------------------------------------------------------>
-    <title>快速上手配置 - WeChatBot</title>
+    <title>快速配置 - 企业智能助手管理平台</title>
     <style>
         body {
             display: flex;
@@ -82,6 +82,11 @@
             border-color: #4caf50;
             box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
             outline: none;
+        }
+        .listen-field-error {
+            outline: 2px solid #dc2626 !important;
+            border-color: #dc2626 !important;
+            background: #fef2f2 !important;
         }
         small {
             font-size: 0.85em;
@@ -308,7 +313,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>WeChatBot 快速上手配置</h1>
+        <h1>企业智能助手 · 快速配置</h1>
         <form method="post" action="{{ url_for('quick_start') }}">
             <h2>1. API 配置</h2>
             <div class="form-group">
@@ -345,11 +350,14 @@
                     {% for item in config.LISTEN_LIST %}
                     <div class="entry">
                         <input type="text" name="nickname" value="{{ item[0] }}" placeholder="微信昵称/备注" required>
-                        <select name="prompt_file" required>
+                        <select name="prompt_file" required data-selected="{{ item[1] }}">
                             <option value="">-- 选择Prompt文件 --</option>
                             {% for file in prompt_files %}
                             <option value="{{ file }}" {% if item[1] == file %}selected{% endif %}>{{ file }}</option>
                             {% endfor %}
+                            {% if item[1] and item[1] not in prompt_files %}
+                            <option value="{{ item[1] }}" selected>原 Prompt 已不存在</option>
+                            {% endif %}
                         </select>
                         <button type="button" onclick="removeEntry(this)">删除</button>
                     </div>
@@ -400,33 +408,14 @@
     </div>
 
     <div class="legal-notice">
-        <div class="legal-toggle" id="toggleLegal">显示法律声明</div>
+        <div class="legal-toggle" id="toggleLegal">显示系统声明</div>
         <div class="legal-content" id="legalContent">
-            <p>
-                Modified based on the <strong>KouriChat</strong> project.<br>
-                原项目版权: Copyright (C) 2025, umaru<br>
-                修改版本版权: Copyright (C) 2026, 阿文睡不醒
-            </p>
-            <p>
-                本软件是自由软件，您可以根据 <a href="https://www.gnu.org/licenses/gpl-3.0.zh-cn.html" target="_blank">
-                GNU 通用公共许可证 第3版（或更高版本）</a> 的条款重新发布和修改本软件。
-            </p>
-            <p>
-                本软件按“现状”提供，不提供任何明示或暗示的担保（包括适销性或特定用途适用性）。<br>
-                如您未收到完整的许可证副本，请访问 <a href="https://www.gnu.org/licenses/gpl-3.0.zh-cn.html" target="_blank">
-                GNU GPL 3.0 中文版</a> 获取。
-            </p>
-            <p>
-                源代码获取：<br>
-                原项目源代码：<a href="https://github.com/KouriChat/KouriChat" target="_blank">https://github.com/KouriChat/KouriChat</a><br>
-                本项目源代码：<a href="https://github.com/awengege/WeChatBot" target="_blank">https://github.com/awengege/WeChatBot</a>
-            </p>
-            <p>
-                本软件仅供学习和娱乐使用，请勿用于违法用途，否则产生的一切法律责任均与任何作者无关。
-            </p>
+            <p>本系统仅供企业内部合法使用。请勿用于违法违规用途。</p>
+            <p>系统按现状提供。开源组件许可证详见项目许可证文件。</p>
         </div>
     </div>
 
+    <script src="{{ url_for('static', filename='js/prompt_options.js') }}"></script>
     <script>
         // 设置API Key输入字段的交互逻辑
         function setupApiKeyInputs() {
@@ -518,23 +507,55 @@
 
             updateProviderUI(); 
             apiProviderSelect.addEventListener('change', updateProviderUI);
+            if (window.PromptOptions) {
+                PromptOptions.load().then(() => {
+                    PromptOptions.refreshSelects('#listen-list select[name="prompt_file"]');
+                });
+            }
+            const quickForm = document.querySelector('form');
+            if (quickForm) {
+                quickForm.addEventListener('submit', function(e) {
+                    if (!window.PromptOptions) return;
+                    const check = PromptOptions.validateListenRows('#listen-list');
+                    if (!check.ok) {
+                        e.preventDefault();
+                        alert(check.message);
+                    }
+                });
+            }
         });
 
-        function addEntry() {
+        async function addEntry() {
             const container = document.getElementById('listen-list');
+            if (!container) return;
             const div = document.createElement('div');
             div.className = 'entry';
-            div.innerHTML = `
-                <input type="text" name="nickname" placeholder="微信昵称/备注" required>
-                <select name="prompt_file" required>
-                    <option value="">-- 选择Prompt文件 --</option>
-                    {% for file in prompt_files %}
-                    <option value="{{ file }}">{{ file }}</option>
-                    {% endfor %}
-                </select>
-                <button type="button" onclick="removeEntry(this)">删除</button>
-            `;
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.name = 'nickname';
+            nameInput.placeholder = '微信昵称/备注';
+            nameInput.required = true;
+            nameInput.addEventListener('input', function() {
+                this.classList.remove('listen-field-error');
+            });
+            const promptSelect = document.createElement('select');
+            promptSelect.name = 'prompt_file';
+            promptSelect.required = true;
+            promptSelect.setAttribute('data-selected', '');
+            const removeBtn = document.createElement('button');
+            removeBtn.type = 'button';
+            removeBtn.textContent = '删除';
+            removeBtn.addEventListener('click', function() {
+                removeEntry(removeBtn);
+            });
+            div.appendChild(nameInput);
+            div.appendChild(promptSelect);
+            div.appendChild(removeBtn);
             container.appendChild(div);
+            if (window.PromptOptions) {
+                await PromptOptions.load();
+                PromptOptions.refreshSelects('#listen-list select[name="prompt_file"]');
+            }
         }
 
         function removeEntry(button) {
@@ -545,10 +566,10 @@
             var content = document.getElementById('legalContent');
             if (content.style.display === 'none' || content.style.display === '') {
                 content.style.display = 'block';
-                this.textContent = '隐藏法律声明';
+                this.textContent = '隐藏系统声明';
             } else {
                 content.style.display = 'none';
-                this.textContent = '显示法律声明';
+                this.textContent = '显示系统声明';
             }
         });
     </script>

@@ -1,0 +1,147 @@
+{
+    "records": {
+        "msg_4dc5a4c851df|1": {
+            "message_id": "msg_4dc5a4c851df",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:28:31Z",
+            "error": "EXTRACTOR_EXCEPTION: name '_resolver_extractor_client' is not defined"
+        },
+        "msg_5ad94ea93a87|1": {
+            "message_id": "msg_5ad94ea93a87",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:28:52Z",
+            "error": "EXTRACTOR_EXCEPTION: name '_resolver_extractor_client' is not defined"
+        },
+        "msg_f0e49aed89f0|1": {
+            "message_id": "msg_f0e49aed89f0",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:29:14Z",
+            "error": "EXTRACTOR_EXCEPTION: name '_resolver_extractor_client' is not defined"
+        },
+        "msg_902f3a12478a|1": {
+            "message_id": "msg_902f3a12478a",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:29:30Z",
+            "error": "EXTRACTOR_EXCEPTION: name '_resolver_extractor_client' is not defined"
+        },
+        "msg_ced57d6285e9|1": {
+            "message_id": "msg_ced57d6285e9",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "",
+            "decision": "UNRELATED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:29:30Z",
+            "error": ""
+        },
+        "msg_28bd8ccc9f3a|1": {
+            "message_id": "msg_28bd8ccc9f3a",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "",
+            "decision": "UNRELATED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:29:30Z",
+            "error": ""
+        },
+        "msg_69810db8c492|1": {
+            "message_id": "msg_69810db8c492",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:30:07Z",
+            "error": "EXTRACTOR_EXCEPTION: name '_resolver_extractor_client' is not defined"
+        },
+        "msg_0451aa6571de|1": {
+            "message_id": "msg_0451aa6571de",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "d5e9de22b2676b4686bd5a371cc913e8c60232b1f3af4dbf0d630512c58b99df",
+            "decision": "NEW_TOPIC",
+            "topic_id": "topic_133346d8cf49",
+            "processed_at": "2026-09-21T06:35:29Z",
+            "error": ""
+        },
+        "msg_0d8083653036|1": {
+            "message_id": "msg_0d8083653036",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "d5e9de22b2676b4686bd5a371cc913e8c60232b1f3af4dbf0d630512c58b99df",
+            "decision": "EXISTING_TOPIC",
+            "topic_id": "topic_133346d8cf49",
+            "processed_at": "2026-09-21T06:35:41Z",
+            "error": ""
+        },
+        "msg_7f194d8c6947|1": {
+            "message_id": "msg_7f194d8c6947",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "d5e9de22b2676b4686bd5a371cc913e8c60232b1f3af4dbf0d630512c58b99df",
+            "decision": "NEW_TOPIC",
+            "topic_id": "topic_d6b1f2e4ac3a",
+            "processed_at": "2026-09-21T06:35:59Z",
+            "error": ""
+        },
+        "msg_fcb3a8bd4475|1": {
+            "message_id": "msg_fcb3a8bd4475",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "d5e9de22b2676b4686bd5a371cc913e8c60232b1f3af4dbf0d630512c58b99df",
+            "decision": "EXISTING_TOPIC",
+            "topic_id": "topic_133346d8cf49",
+            "processed_at": "2026-09-21T06:36:16Z",
+            "error": ""
+        },
+        "msg_9138d300a242|1": {
+            "message_id": "msg_9138d300a242",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "TOPIC_EXTRACTOR",
+            "extractor_prompt_hash": "d5e9de22b2676b4686bd5a371cc913e8c60232b1f3af4dbf0d630512c58b99df",
+            "decision": "EXISTING_TOPIC",
+            "topic_id": "topic_133346d8cf49",
+            "processed_at": "2026-09-21T06:36:40Z",
+            "error": ""
+        },
+        "msg_3a40fc1c456d|1": {
+            "message_id": "msg_3a40fc1c456d",
+            "conversation_id": "conv_6fbe0f455b94",
+            "topic_processing_version": 1,
+            "extractor_prompt_name": "",
+            "extractor_prompt_hash": "",
+            "decision": "FAILED",
+            "topic_id": null,
+            "processed_at": "2026-09-21T06:39:13Z",
+            "error": "EXTRACTOR_TIMEOUT: EXTRACTOR_TIMEOUT"
+        }
+    }
+}

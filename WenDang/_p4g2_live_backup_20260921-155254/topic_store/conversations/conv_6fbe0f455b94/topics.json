@@ -1,0 +1,30 @@
+{
+    "topics": [
+        {
+            "id": "topic_133346d8cf49",
+            "conversation_id": "conv_6fbe0f455b94",
+            "title": "ERP 增量同步异常",
+            "summary": "ERP 增量同步今天仍存在问题，供应商编码是其中一个相关点。",
+            "status": "ACTIVE",
+            "confidence": "HIGH",
+            "created_at": "1789972515",
+            "updated_at": "2026-09-21T06:36:39Z",
+            "last_message_at": "1789972586",
+            "message_count": 8,
+            "schema_version": 1
+        },
+        {
+            "id": "topic_d6b1f2e4ac3a",
+            "conversation_id": "conv_6fbe0f455b94",
+            "title": "质检员可见采购价格",
+            "summary": "质检员目前仍能看到采购价格，属于权限可见性问题。",
+            "status": "ACTIVE",
+            "confidence": "HIGH",
+            "created_at": "1789972547",
+            "updated_at": "2026-09-21T06:35:59Z",
+            "last_message_at": "1789972547",
+            "message_count": 2,
+            "schema_version": 1
+        }
+    ]
+}

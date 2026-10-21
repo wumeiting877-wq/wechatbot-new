@@ -3,6 +3,7 @@ recursive-include prompts *
 recursive-include templates *
 recursive-include Demo_Image *
 recursive-include forum_data *
+recursive-include static *
 include LICENSE
 include readme.md
 include CHANGELOG.md

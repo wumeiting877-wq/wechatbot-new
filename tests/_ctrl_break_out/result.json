@@ -1,0 +1,15 @@
+{
+  "WEB_PID": 33020,
+  "BOT_PID": 28848,
+  "BOT_PPID": 33020,
+  "parent_received_sigbreak": false,
+  "child_received_sigbreak": true,
+  "child_exit_code": 0,
+  "kill_error": null,
+  "parent_still_alive": true,
+  "parent_console_pids_after": [
+    33020,
+    40728
+  ],
+  "creationflags": "CREATE_NEW_PROCESS_GROUP"
+}

@@ -26,6 +26,8 @@ import os
 import re
 import sqlite3
 import time
+import ctypes
+from ctypes import wintypes
 
 from wechatauto.wx import WeChat as _BaseWeChat
 from wechatauto.wx import Chat as _BaseChat
@@ -103,12 +105,30 @@ class WxMessage:
         self.type = _TYPE_MAP.get(type_cn, "text")
 
         sender_id = row.get("sender_id")
-        self._is_group = bool(
-            self._chat
-            and str(getattr(self._chat, "_wxid", "")).endswith("@chatroom")
-        )
-        is_self = sender_id in (2, "2") or str(sender_id) == self._self_wxid
-        self.attr = "self" if is_self else "friend"
+        self.sender_id = sender_id
+        self.sender_username = _to_text(row.get("sender_username") or row.get("sender_wxid") or "")
+        self.sender_wxid = self.sender_username
+        self.chat_wxid = ""
+        if self._chat:
+            self.chat_wxid = str(getattr(self._chat, "_wxid", "") or "")
+        self._is_group = bool(self.chat_wxid.endswith("@chatroom"))
+        self.platform_message_id = ""
+        if self.local_id is not None:
+            self.platform_message_id = "%s:%s" % (self.chat_wxid or "chat", self.local_id)
+        self.direction = "INBOUND"
+
+        # 禁止仅凭 sender_id==2 标 self。只有稳定身份（sender wxid == bot wxid）才写 attr=self。
+        confirmed_self = False
+        if self.sender_wxid and self._self_wxid and str(self.sender_wxid) == str(self._self_wxid):
+            confirmed_self = True
+        elif self._self_wxid and str(sender_id) == str(self._self_wxid):
+            confirmed_self = True
+        if confirmed_self:
+            self.attr = "self"
+            self.direction = "OUTBOUND"
+        else:
+            self.attr = "friend"
+            self.direction = "INBOUND"
 
         content = _to_text(row.get("content"))
         prefix = self._extract_prefix_sender(content)
@@ -147,8 +167,8 @@ class WxMessage:
         return m.group(1) if m else None
 
     def _resolve_sender(self, sender_id, prefix):
-        # 微信4.x 数据库里 real_sender_id 只是短数字ID，不能当 wxid 用。
-        if self.attr == "self":
+        # 不再因 sender_id==2 把发送者改成机器人昵称（同机分身会误伤）。
+        if self.attr == "self" and self.direction == "OUTBOUND":
             try:
                 return self._db.get_self_info().get("nick_name") or "我"
             except Exception:
@@ -320,15 +340,93 @@ class WxMessage:
             return False
 
     def __str__(self):
-        return "<WxMessage %s from %s: %s>" % (self.type, self.sender, self.content[:50])
+        return "<WxMessage %s from %s: %s>" % (self.type, self.sender, (self.content or "")[:50])
+
+
+_WX_PROCESS_NAMES = {"weixin.exe", "wechat.exe", "wechatappex.exe"}
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SW_SHOW = 5
+SW_RESTORE = 9
+
+
+def _weixin_process_name(pid):
+    if not pid:
+        return ""
+    handle = ctypes.windll.kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+            handle, 0, buf, ctypes.byref(size)
+        )
+        if ok:
+            return os.path.basename(buf.value).lower()
+    except Exception:
+        return ""
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    return ""
+
+
+def restore_wechat_windows():
+    """把托盘/最小化/隐藏的微信主窗口重新显示出来。
+
+    停止 Bot 时若进程被强杀，微信 4.x 主窗口经常被收到托盘或变成不可见。
+    wechatauto 初始化只枚举可见窗口，因此第二次启动会误报“未找到微信主窗口”。
+    """
+    user32 = ctypes.windll.user32
+    restored = []
+
+    def _cb(hwnd, _lp):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if _weixin_process_name(pid.value) not in _WX_PROCESS_NAMES:
+            return True
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        hidden = (not user32.IsWindowVisible(hwnd)) or bool(user32.IsIconic(hwnd))
+        if not hidden and width < 200 and height < 200:
+            return True
+        user32.ShowWindow(hwnd, SW_SHOW)
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        if hidden:
+            restored.append(hwnd)
+        return True
+
+    try:
+        CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(CB(_cb), 0)
+    except Exception as exc:
+        log.warning("恢复微信窗口失败: %s", exc)
+        return 0
+    if restored:
+        log.info("已恢复 %d 个微信窗口，准备重新连接", len(restored))
+        time.sleep(0.8)
+    return len(restored)
 
 
 class WeChat(_BaseWeChat):
     """兼容层主类：在 wechatauto.wx.WeChat 之上补齐 bot 需要的接口。"""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._media = MediaDownloader(self._db)
+        last_error = None
+        for attempt in range(1, 7):
+            restore_wechat_windows()
+            try:
+                super().__init__(*args, **kwargs)
+                self._media = MediaDownloader(self._db)
+                return
+            except Exception as exc:
+                last_error = exc
+                log.warning("微信初始化失败(第%d/6次): %s", attempt, exc)
+                time.sleep(1.2)
+        raise last_error
 
     # ------------------------------------------------------------- 消息监听
 
@@ -418,6 +516,13 @@ class WeChat(_BaseWeChat):
         return who
 
     def SendMsg(self, msg, who=None, **kwargs):
+        try:
+            from bot_runtime import runtime
+            if not runtime.allow_ui_automation():
+                log.warning("已阻止 SendMsg：bot_state=%s", runtime.state)
+                return WxResponse.failure("bot_not_running")
+        except Exception:
+            pass
         return super().SendMsg(msg, who=self._display_name(who), **kwargs)
 
     def SendFiles(self, filepath, who=None, **kwargs):

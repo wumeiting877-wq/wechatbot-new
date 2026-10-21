@@ -1,0 +1,198 @@
+    .chat-round-card {
+        background: #f7f8fc;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        margin-bottom: 22px;
+        padding: 18px 18px 12px 18px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        position: relative;
+    }
+    .chat-round-card .delete-round-btn {
+        position: absolute;
+        top: 12px;
+        right: 16px;
+        background: #f44336;
+        color: #fff;
+        border: none;
+        border-radius: 4px;
+        padding: 4px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+    .chat-round-card .delete-round-btn:hover {
+        background: #d32f2f;
+    }
+    .chat-round-label {
+        font-weight: bold;
+        color: #388e3c;
+        margin-bottom: 6px;
+        font-size: 15px;
+    }
+    .chat-round-textarea {
+        width: 100%;
+        min-height: 70px;
+        height: 110px;
+        max-height: 220px;
+        font-size: 16px;
+        font-family: monospace;
+        padding: 12px;
+        border-radius: 6px;
+        border: 1.5px solid #bdbdbd;
+        margin-bottom: 10px;
+        box-sizing: border-box;
+        resize: vertical;
+        background: #fff;
+        transition: border 0.2s;
+    }
+    .chat-round-textarea:focus {
+        border: 1.5px solid #4caf50;
+        outline: none;
+        background: #e8f5e9;
+    }
+    
+    /* 核心记忆片段样式 */
+    .memory-item-card {
+        background: #fff3e0;
+        border: 1px solid #ffcc02;
+        border-radius: 8px;
+        margin-bottom: 22px;
+        padding: 18px 18px 12px 18px;
+        box-shadow: 0 2px 8px rgba(255, 193, 7, 0.15);
+        position: relative;
+    }
+    .memory-item-card .delete-memory-btn {
+        position: absolute;
+        top: 12px;
+        right: 16px;
+        background: #f44336;
+        color: #fff;
+        border: none;
+        border-radius: 4px;
+        padding: 4px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+    .memory-item-card .delete-memory-btn:hover {
+        background: #d32f2f;
+    }
+    .memory-item-label {
+        font-weight: bold;
+        color: #e65100;
+        margin-bottom: 6px;
+        font-size: 15px;
+    }
+    .memory-item-textarea {
+        width: 100%;
+        min-height: 70px;
+        height: 110px;
+        max-height: 220px;
+        font-size: 16px;
+        font-family: monospace;
+        padding: 12px;
+        border-radius: 6px;
+        border: 1.5px solid #ffcc02;
+        margin-bottom: 10px;
+        box-sizing: border-box;
+        resize: vertical;
+        background: #fff;
+        transition: border 0.2s;
+    }
+    .memory-item-textarea:focus {
+        border: 1.5px solid #ff9800;
+        outline: none;
+        background: #fff3e0;
+    }
+    .memory-item-input {
+        width: 100%;
+        padding: 8px 12px;
+        border: 1.5px solid #ffcc02;
+        border-radius: 4px;
+        font-size: 14px;
+        box-sizing: border-box;
+        background: #fff;
+        transition: border 0.2s;
+    }
+    .memory-item-input:focus {
+        border: 1.5px solid #ff9800;
+        outline: none;
+        background: #fff3e0;
+    }
+    .core-memory-file-item {
+        background: #fff;
+        padding: 15px;
+        margin-bottom: 10px;
+        border-radius: 8px;
+        box-shadow: 0 2px 5px rgba(255, 193, 7, 0.2);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        transition: transform 0.2s, box-shadow 0.2s;
+        border-left: 4px solid #ffcc02;
+    }
+    .core-memory-file-item:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 10px rgba(255, 193, 7, 0.3);
+    }
+    .core-memory-file-item .file-info {
+        flex: 1;
+    }
+    .core-memory-file-item .file-actions {
+        display: flex;
+        gap: 10px;
+    }
+    .core-memory-file-item .file-actions button {
+        padding: 6px 12px;
+        font-size: 13px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background-color 0.2s;
+    }
+    .core-memory-file-item .edit-memory-btn {
+        background: #ff9800;
+        color: white;
+    }
+    .core-memory-file-item .edit-memory-btn:hover {
+        background: #f57c00;
+    }
+    .core-memory-file-item .delete-memory-file-btn {
+        background: #f44336;
+        color: white;
+    }
+    .core-memory-file-item .delete-memory-file-btn:hover {
+        background: #d32f2f;
+    }
+    
+    /* 时间选择器样式优化 */
+    .memory-time-picker {
+        font-family: inherit !important;
+        font-size: 14px !important;
+    }
+    
+    .memory-time-now-btn {
+        transition: background-color 0.2s !important;
+        font-weight: 500 !important;
+        white-space: nowrap !important;
+    }
+    
+    .memory-time-now-btn:hover {
+        background: #f57c00 !important;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 4px rgba(245, 124, 0, 0.3);
+    }
+    
+    .memory-time-now-btn:active {
+        transform: translateY(0);
+        box-shadow: 0 1px 2px rgba(245, 124, 0, 0.3);
+    }
+    
+    /* 时间格式显示样式 */
+    .memory-item-card small {
+        background: rgba(255, 193, 7, 0.1);
+        padding: 4px 8px;
+        border-radius: 4px;
+        border-left: 3px solid #ffcc02;
+        font-family: monospace;
+    }

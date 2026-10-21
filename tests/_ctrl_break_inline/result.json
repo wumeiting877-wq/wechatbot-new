@@ -1,0 +1,16 @@
+{
+  "WEB_PID": 19888,
+  "BOT_PID": 39288,
+  "BOT_PPID": 19888,
+  "parent_received_sigbreak": false,
+  "child_received_sigbreak": true,
+  "child_exit_code": 0,
+  "kill_error": null,
+  "parent_still_alive": true,
+  "parent_console_pids_after": [
+    19888,
+    27564,
+    40180
+  ],
+  "creationflags": "CREATE_NEW_PROCESS_GROUP"
+}

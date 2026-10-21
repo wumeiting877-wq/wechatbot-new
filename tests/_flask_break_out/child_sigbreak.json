@@ -1,0 +1,6 @@
+{
+  "role": "child",
+  "event": "SIGBREAK",
+  "signum": 21,
+  "pid": 34820
+}

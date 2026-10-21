@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Test wxbot module"""
+"""手工联调脚本，不是自动化测试。
+
+会连接真实微信，并向「文件传输助手」发消息。
+不要在 CI 中运行，也不要把它当成单元测试。
+"""
 import sys
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.path.insert(0, r'D:\WeChatBot-main')

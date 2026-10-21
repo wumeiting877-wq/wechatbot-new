@@ -17,12 +17,27 @@ venv/
 # 离线依赖缓存（第三方 wheel，不纳入版本控制）
 libs/
 
-# 运行时生成的数据
-chat_contexts.json
-user_timers.json
+# 本地配置与密钥（永不入库）
+.env
+secrets.env
+config.local.json
+config.local.yaml
+config.py.legacy.bak
+
+# 运行时生成的数据（注意大小写：代码使用 CoreMemory/ Memory_Temp/）
+CoreMemory/
 core_memory/
+Memory_Temp/
 memory_temp/
+chat_contexts.json
+chat_contexts.json.lock
+user_timers.json
+recurring_reminders.json
+runtime_control/
 forum_data/npc_config.json
+forum_data/*.json
+data/
+logs/
 
 # 日志
 *.log

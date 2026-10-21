@@ -1,0 +1,242 @@
+{
+  "conversation": {
+    "id": "conv_zhiqun_demo01",
+    "platform": "WECHAT",
+    "conversation_type": "GROUP",
+    "display_name": "智群Demo"
+  },
+  "source": "P5-G0 Decision CASE-D01..D08",
+  "purpose": "P5 Decision extraction only. Topics are pre-formed. Suggestion is not Decision. Do not auto SUPERSEDED. Do not assert Task/Risk.",
+  "topics": [
+    {
+      "id": "topic_demo_erp",
+      "key": "A",
+      "title": "ERP 数据同步异常",
+      "summary": "增量同步仍有供应商编码空值"
+    },
+    {
+      "id": "topic_demo_perm",
+      "key": "B",
+      "title": "权限整改",
+      "summary": "质检员仍能看到采购价格"
+    },
+    {
+      "id": "topic_demo_demo",
+      "key": "C",
+      "title": "现场演示准备",
+      "summary": "周五现场演示需要离线包"
+    }
+  ],
+  "shared_rules": {
+    "suggestion_is_not_decision": true,
+    "created_by_is_confirmation_not_suggestion": true,
+    "bare_ok_is_not_decision": true,
+    "no_decision_update": true,
+    "auto_superseded_forbidden": true,
+    "v1_status_write": ["RECORDED"],
+    "max_decisions_per_message": 5,
+    "task_id_forbidden": true
+  },
+  "cases": [
+    {
+      "id": "CASE-D01",
+      "name": "明确决定",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_d01_suggest",
+          "created_at": "2026-09-22T10:20:00+08:00",
+          "sender_name": "王强",
+          "content": "我建议供应商编码缺失的数据先进异常池。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d01_confirm",
+        "created_at": "2026-09-22T10:21:00+08:00",
+        "sender_name": "周敏",
+        "content": "可以，就按照异常池方案执行。"
+      },
+      "expected": {
+        "new_decision_count": 1,
+        "status": "RECORDED",
+        "created_by_message_id": "msg_demo_d01_confirm",
+        "related_may_include": ["msg_demo_d01_suggest"],
+        "created_by_must_not": ["msg_demo_d01_suggest"],
+        "supersedes_decision_id": null,
+        "title_whitelist": ["采用异常池方案", "按异常池方案执行", "异常池方案"],
+        "decision_text_contains": ["异常池"]
+      }
+    },
+    {
+      "id": "CASE-D02",
+      "name": "单独建议不是 Decision",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d02_suggest",
+        "created_at": "2026-09-22T10:20:00+08:00",
+        "sender_name": "王强",
+        "content": "我建议供应商编码缺失的数据先进异常池。"
+      },
+      "expected": {
+        "new_decision_count": 0,
+        "decision": "UNRELATED"
+      }
+    },
+    {
+      "id": "CASE-D03",
+      "name": "模糊确认宁可不建",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_d03_suggest",
+          "created_at": "2026-09-22T10:20:00+08:00",
+          "sender_name": "王强",
+          "content": "我建议供应商编码缺失的数据先进异常池。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d03_ok",
+        "created_at": "2026-09-22T10:22:00+08:00",
+        "sender_name": "周敏",
+        "content": "行。"
+      },
+      "expected": {
+        "new_decision_count": 0,
+        "decision": "UNRELATED",
+        "conservative": true,
+        "reason": "bare acknowledgement must not become enterprise fact"
+      }
+    },
+    {
+      "id": "CASE-D04",
+      "name": "明确拍板",
+      "topic_id": "topic_demo_demo",
+      "existing_decisions": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_d04_ctx",
+          "created_at": "2026-09-22T11:00:00+08:00",
+          "sender_name": "赵凯",
+          "content": "现场演示账号还没定，demo-viewer 可以给客户看。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d04_confirm",
+        "created_at": "2026-09-22T11:02:00+08:00",
+        "sender_name": "周敏",
+        "content": "那就这么定，现场演示使用 demo-viewer 账号。"
+      },
+      "expected": {
+        "new_decision_count": 1,
+        "status": "RECORDED",
+        "created_by_message_id": "msg_demo_d04_confirm",
+        "decision_text_contains": ["demo-viewer"]
+      }
+    },
+    {
+      "id": "CASE-D05",
+      "name": "修改决定保留历史",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [
+        {
+          "id": "dec_demo_incr",
+          "title": "采用增量同步",
+          "decision_text": "决定使用增量同步。",
+          "status": "RECORDED",
+          "created_msg_id": "msg_demo_d05_old"
+        }
+      ],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_d05_old",
+          "created_at": "2026-09-22T10:00:00+08:00",
+          "sender_name": "周敏",
+          "content": "决定先用增量同步。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d05_new",
+        "created_at": "2026-09-22T11:00:00+08:00",
+        "sender_name": "周敏",
+        "content": "刚才那个方案改了，改成全量同步。"
+      },
+      "expected": {
+        "new_decision_count": 1,
+        "old_decision_id": "dec_demo_incr",
+        "old_decision_text_unchanged": true,
+        "old_status": "RECORDED",
+        "old_status_not": ["SUPERSEDED", "CANCELLED"],
+        "supersedes_decision_id": "dec_demo_incr",
+        "decision_text_contains": ["全量同步"],
+        "no_decision_update": true
+      }
+    },
+    {
+      "id": "CASE-D06",
+      "name": "当前问题事实不是 Decision",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_d06_problem",
+        "created_at": "2026-09-22T09:30:00+08:00",
+        "sender_name": "王强",
+        "content": "ERP 同步失败了。"
+      },
+      "expected": {
+        "new_decision_count": 0
+      }
+    },
+    {
+      "id": "CASE-D07",
+      "name": "Task 指令不是 Decision",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_d07_task",
+        "created_at": "2026-09-22T09:40:00+08:00",
+        "sender_name": "周敏",
+        "content": "王强今天 17 点前处理完。"
+      },
+      "expected": {
+        "new_decision_count": 0
+      }
+    },
+    {
+      "id": "CASE-D08",
+      "name": "收到不是 Decision",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_d08_ack",
+        "created_at": "2026-09-22T09:41:00+08:00",
+        "sender_name": "王强",
+        "content": "收到"
+      },
+      "expected": {
+        "new_decision_count": 0,
+        "allow_rule_prefilter": true
+      }
+    }
+  ]
+}

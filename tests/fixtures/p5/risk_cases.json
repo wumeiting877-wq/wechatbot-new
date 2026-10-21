@@ -1,0 +1,264 @@
+{
+  "conversation": {
+    "id": "conv_zhiqun_demo01",
+    "platform": "WECHAT",
+    "conversation_type": "GROUP",
+    "display_name": "智群Demo"
+  },
+  "source": "P5-G0 Risk CASE-R01..R08",
+  "purpose": "P5 Risk extraction only. Topics are pre-formed. Current problem is not Risk. Do not auto RESOLVED. No severity. Do not assert Decision.",
+  "topics": [
+    {
+      "id": "topic_demo_erp",
+      "key": "A",
+      "title": "ERP 数据同步异常",
+      "summary": "增量同步仍有供应商编码空值"
+    },
+    {
+      "id": "topic_demo_perm",
+      "key": "B",
+      "title": "权限整改",
+      "summary": "质检员仍能看到采购价格"
+    },
+    {
+      "id": "topic_demo_demo",
+      "key": "C",
+      "title": "现场演示准备",
+      "summary": "周五现场演示需要离线包"
+    }
+  ],
+  "shared_rules": {
+    "current_problem_is_not_risk": true,
+    "suggestion_is_not_risk": true,
+    "require_condition_and_impact": true,
+    "auto_resolved_forbidden": true,
+    "severity_forbidden": true,
+    "task_id_optional": true,
+    "v1_status_write": ["OPEN"],
+    "max_risks_per_message": 5
+  },
+  "cases": [
+    {
+      "id": "CASE-R01",
+      "name": "明确 Risk",
+      "topic_id": "topic_demo_erp",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_r01_risk",
+        "created_at": "2026-09-22T14:10:00+08:00",
+        "sender_name": "周敏",
+        "content": "如果今天还修不好，会影响明天现场演示。"
+      },
+      "expected": {
+        "new_risk_count": 1,
+        "status": "OPEN",
+        "condition_contains": ["修不好"],
+        "impact_contains": ["演示"],
+        "severity": null,
+        "task_id": null
+      }
+    },
+    {
+      "id": "CASE-R02",
+      "name": "当前问题不是 Risk",
+      "topic_id": "topic_demo_erp",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_r02_problem",
+        "created_at": "2026-09-22T09:30:00+08:00",
+        "sender_name": "王强",
+        "content": "ERP 同步失败了。"
+      },
+      "expected": {
+        "new_risk_count": 0,
+        "decision": "UNRELATED"
+      }
+    },
+    {
+      "id": "CASE-R03",
+      "name": "建议不是 Risk",
+      "topic_id": "topic_demo_demo",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_r03_ctx",
+          "created_at": "2026-09-22T13:00:00+08:00",
+          "sender_name": "赵凯",
+          "content": "现场网络不一定稳。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_r03_suggest",
+        "created_at": "2026-09-22T13:01:00+08:00",
+        "sender_name": "赵凯",
+        "content": "最好准备一个离线包。"
+      },
+      "expected": {
+        "new_risk_count": 0
+      }
+    },
+    {
+      "id": "CASE-R04",
+      "name": "当前事实加未来影响",
+      "topic_id": "topic_demo_demo",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_r04_risk",
+        "created_at": "2026-09-22T13:10:00+08:00",
+        "sender_name": "赵凯",
+        "content": "现场 Wi-Fi 现在不稳定，如果断网会导致系统无法演示。"
+      },
+      "expected": {
+        "new_risk_count": 1,
+        "status": "OPEN",
+        "condition_contains": ["Wi-Fi", "断网"],
+        "impact_contains": ["无法演示"],
+        "severity": null
+      }
+    },
+    {
+      "id": "CASE-R05",
+      "name": "模糊担忧不建",
+      "topic_id": "topic_demo_erp",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_r05_vague",
+        "created_at": "2026-09-22T13:12:00+08:00",
+        "sender_name": "李娜",
+        "content": "感觉有点危险。"
+      },
+      "expected": {
+        "new_risk_count": 0
+      }
+    },
+    {
+      "id": "CASE-R06",
+      "name": "已恢复不得自动 RESOLVED",
+      "topic_id": "topic_demo_demo",
+      "existing_risks": [
+        {
+          "id": "risk_demo_wifi",
+          "title": "断网无法演示",
+          "condition_text": "现场 Wi-Fi 不稳定导致断网",
+          "impact_text": "系统无法演示",
+          "status": "OPEN",
+          "created_msg_id": "msg_demo_r04_risk"
+        }
+      ],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_r04_risk",
+          "created_at": "2026-09-22T13:10:00+08:00",
+          "sender_name": "赵凯",
+          "content": "现场 Wi-Fi 现在不稳定，如果断网会导致系统无法演示。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_r06_recovered",
+        "created_at": "2026-09-22T16:00:00+08:00",
+        "sender_name": "赵凯",
+        "content": "Wi-Fi 已经恢复了。"
+      },
+      "expected": {
+        "new_risk_count": 0,
+        "update_count": 0,
+        "old_risk_id": "risk_demo_wifi",
+        "old_status": "OPEN",
+        "old_status_not": ["RESOLVED", "MITIGATED", "CLOSED"],
+        "allow_unrelated": true
+      }
+    },
+    {
+      "id": "CASE-R07",
+      "name": "Task 本身不是 Risk",
+      "topic_id": "topic_demo_demo",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_r07_task",
+        "created_at": "2026-09-22T13:20:00+08:00",
+        "sender_name": "周敏",
+        "content": "赵凯明天准备离线包。"
+      },
+      "expected": {
+        "new_risk_count": 0
+      }
+    },
+    {
+      "id": "CASE-R08",
+      "name": "收到不是 Risk",
+      "topic_id": "topic_demo_erp",
+      "existing_risks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_r08_ack",
+        "created_at": "2026-09-22T13:21:00+08:00",
+        "sender_name": "王强",
+        "content": "收到。"
+      },
+      "expected": {
+        "new_risk_count": 0,
+        "allow_rule_prefilter": true
+      }
+    },
+    {
+      "id": "CASE-R09",
+      "name": "同一担忧更具体则 RISK_UPDATE",
+      "topic_id": "topic_demo_erp",
+      "existing_risks": [
+        {
+          "id": "risk_demo_repair",
+          "title": "今日未修复将影响明日演示",
+          "condition_text": "如果今天修不好",
+          "impact_text": "会影响明天演示",
+          "status": "OPEN",
+          "created_msg_id": "msg_demo_r01_risk"
+        }
+      ],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_r01_risk",
+          "created_at": "2026-09-22T14:10:00+08:00",
+          "sender_name": "周敏",
+          "content": "如果今天还修不好，会影响明天现场演示。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_r09_update",
+        "created_at": "2026-09-22T20:00:00+08:00",
+        "sender_name": "周敏",
+        "content": "如果今晚 8 点前还修不好，明早客户演示会受影响。"
+      },
+      "expected": {
+        "new_risk_count": 0,
+        "update_count": 1,
+        "risk_count": 1,
+        "status": "OPEN",
+        "old_risk_id": "risk_demo_repair",
+        "condition_contains": ["今晚", "修不好"],
+        "impact_contains": ["演示"],
+        "decision": "RISK_UPDATE"
+      }
+    }
+  ]
+}

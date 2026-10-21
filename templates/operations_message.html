@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>消息处理详情</title>
+    <style>
+        body { margin: 0; font-family: "Segoe UI", "PingFang SC", sans-serif; background: #f4f6f8; color: #1f2933; }
+        header { background: #1f2933; color: #fff; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+        header a { color: #d9e2ec; text-decoration: none; }
+        main { padding: 20px 24px 40px; max-width: 1100px; }
+        h1 { font-size: 20px; margin: 0; font-weight: 600; }
+        h2 { font-size: 16px; margin: 0 0 12px; }
+        h3 { font-size: 14px; margin: 16px 0 8px; }
+        section { background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+        .engine { border-top: 1px solid #e4e7eb; margin-top: 16px; padding-top: 8px; }
+        dl { margin: 0; display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; }
+        dt { color: #7b8794; font-size: 12px; padding-top: 4px; }
+        dd { margin: 0; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border-bottom: 1px solid #e4e7eb; text-align: left; padding: 8px 6px; vertical-align: top; }
+        th { color: #52606d; font-weight: 600; background: #f8fafc; }
+        .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; line-height: 1.6; }
+        .tag-success { background: #e3f9e5; color: #0e6245; }
+        .tag-failed { background: #ffe8e6; color: #9b1c1c; }
+        .tag-unknown { background: #fff4d6; color: #8d4b00; }
+        .banner { background: #fff8e6; border: 1px solid #f0d48a; padding: 8px 10px; font-size: 13px; margin: 8px 0 12px; }
+        .muted { color: #7b8794; font-size: 12px; }
+        .content { white-space: pre-wrap; }
+        .sub { margin-top: 8px; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>消息处理详情</h1>
+    <a href="{{ url_for('index') }}">返回配置</a>
+</header>
+<main>
+    <p><a href="{{ url_for('operations_home') }}">← 返回运维中心</a></p>
+    {% if missing %}
+    <section>
+        <h2>消息信息</h2>
+        <p>无记录。Message ID：{{ message_id }}</p>
+    </section>
+    {% else %}
+    <section>
+        <h2>消息信息</h2>
+        <dl>
+            <dt>时间</dt>
+            <dd>
+                {{ detail.message.timestamps[0].value }}
+                <div class="muted">来源：{{ detail.message.timestamps[0].source }}</div>
+            </dd>
+            <dt>入库时间</dt>
+            <dd>
+                {{ detail.message.timestamps[1].value }}
+                <div class="muted">来源：{{ detail.message.timestamps[1].source }}</div>
+            </dd>
+            <dt>发送人</dt>
+            <dd>{{ detail.message.sender_name }}</dd>
+            <dt>消息内容</dt>
+            <dd class="content">{{ detail.message.content }}</dd>
+            <dt>Conversation</dt>
+            <dd>{{ detail.message.conversation_id }}</dd>
+            <dt>Message ID</dt>
+            <dd>{{ detail.message.id }}</dd>
+        </dl>
+    </section>
+
+    <section>
+        <h2>Runtime / Engine 状态</h2>
+        <dl>
+            <dt>Bot</dt>
+            <dd>{{ detail.runtime.runtime.runtime_state or "未记录" }}</dd>
+            <dt>正在接收工作</dt>
+            <dd>{{ "是" if detail.runtime.runtime.is_accepting_work else "否" }}</dd>
+            <dt>Topic Engine</dt>
+            <dd>{{ "已启用" if detail.runtime.engines.topic_enabled else "已关闭" }}</dd>
+            <dt>Task Engine</dt>
+            <dd>{{ "已启用" if detail.runtime.engines.task_enabled else "已关闭" }}</dd>
+            <dt>Decision Engine</dt>
+            <dd>{{ "已启用" if detail.runtime.engines.decision_enabled else "已关闭" }}</dd>
+            <dt>Risk Engine</dt>
+            <dd>{{ "已启用" if detail.runtime.engines.risk_enabled else "已关闭" }}</dd>
+        </dl>
+    </section>
+
+    <section>
+        <h2>处理状态</h2>
+        <table>
+            <thead>
+            <tr>
+                <th>Engine</th>
+                <th>状态</th>
+                <th>已存储 decision</th>
+                <th>可重试</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for key in ("topic", "task", "decision", "risk") %}
+            {% set view = detail.operations_state[key] %}
+            <tr>
+                <td>{{ key }}</td>
+                <td>
+                    <span class="tag {% if view.state == 'SUCCESS' %}tag-success{% elif view.state == 'FAILED_RETRYABLE' %}tag-failed{% else %}tag-unknown{% endif %}">
+                        {{ view.state_label }}
+                    </span>
+                </td>
+                <td>{{ view.decision or "未提供" }}</td>
+                <td>{{ "是" if view.retryable else "否" }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <p class="muted">处理状态来自只读分类。本页不提供重试、修复或重新处理。</p>
+    </section>
+
+    <section>
+        <h2>诊断详情</h2>
+        <div class="banner">{{ detail.diagnostics.audit_notice }}</div>
+        {% for key in ("topic", "task", "decision", "risk") %}
+        {% set block = detail[key] %}
+        <div class="engine">
+            <h3>{{ key }}</h3>
+            {% if block.state == 'NOT_FOUND_UNKNOWN' %}
+            <p><span class="tag tag-unknown">需人工调查</span></p>
+            {% endif %}
+            <ul>
+                {% for line in block.investigation_lines %}
+                <li>{{ line }}</li>
+                {% endfor %}
+            </ul>
+            <p class="muted">diagnosis_summary：{{ block.diagnosis_summary }}</p>
+            <p class="muted">观察标记：{{ block.diagnostic_flags | join("，") if block.diagnostic_flags else "无记录" }}</p>
+
+            <h3>Processing</h3>
+            {% if not block.processing_found %}
+            <p>Processing Record：未找到</p>
+            {% else %}
+            <dl>
+                {% for field in block.processing.fields %}
+                <dt>{{ field.name }}</dt>
+                <dd>{{ field.value }}</dd>
+                {% endfor %}
+                {% for stamp in block.processing.timestamps %}
+                <dt>{{ stamp.field }}</dt>
+                <dd>{{ stamp.value }} <span class="muted">来源：{{ stamp.source }}</span></dd>
+                {% endfor %}
+            </dl>
+            {% endif %}
+
+            <h3>Entity</h3>
+            {% if block.entity_count == 0 %}
+            <p>无记录</p>
+            {% else %}
+            <p>{{ block.entity_count }} 条</p>
+            {% for entity in block.entities %}
+            <div class="sub">
+                <dl>
+                    {% for field in entity.fields %}
+                    <dt>{{ field.name }}</dt>
+                    <dd>
+                        {{ field.value }}
+                        {% if field.source_field in ("created_at", "updated_at", "last_message_at") %}
+                        <span class="muted">来源：entity.{{ field.source_field }}</span>
+                        {% endif %}
+                    </dd>
+                    {% endfor %}
+                </dl>
+            </div>
+            {% endfor %}
+            {% endif %}
+
+            <h3>Evidence</h3>
+            {% for relation in ("CREATED_BY", "UPDATED_BY", "RELATED") %}
+            <p>{{ relation }}：{{ block.evidence.counts[relation] }} 条</p>
+            {% if block.evidence.counts[relation] == 0 %}
+            <p class="muted">无记录</p>
+            {% else %}
+            <table>
+                <thead>
+                <tr>
+                    <th>relation</th>
+                    <th>entity_id</th>
+                    <th>message_id</th>
+                    <th>时间</th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for link in block.evidence[relation] %}
+                <tr>
+                    <td>{{ link.relation }}</td>
+                    <td>{{ link.entity_id }}</td>
+                    <td>{{ link.message_id }}</td>
+                    <td>
+                        {{ link.timestamps[0].value }}
+                        <div class="muted">来源：{{ link.timestamps[0].source }}</div>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+            {% endfor %}
+
+            <h3>Audit</h3>
+            <div class="banner">{{ block.audit_notice }}</div>
+            {% if not block.audit_events %}
+            <p>无记录</p>
+            {% else %}
+            <table>
+                <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>decision</th>
+                    <th>error</th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for event in block.audit_events %}
+                <tr>
+                    <td>
+                        {{ event.timestamps[0].value }}
+                        <div class="muted">来源：{{ event.timestamps[0].source }}</div>
+                    </td>
+                    <td>{{ event.decision or "未提供" }}</td>
+                    <td>{{ event.error or "未提供" }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </section>
+
+    <section>
+        <h2>人工重试审计</h2>
+        <div class="banner">{{ detail.diagnostics.manual_action_notice }}</div>
+        {% if not detail.diagnostics.manual_actions %}
+        <p>无记录</p>
+        {% else %}
+        <table>
+            <thead>
+            <tr>
+                <th>时间</th>
+                <th>event</th>
+                <th>engine</th>
+                <th>executed</th>
+                <th>after_state</th>
+                <th>error</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for action in detail.diagnostics.manual_actions %}
+            <tr>
+                <td>
+                    {{ action.timestamps[0].value }}
+                    <div class="muted">来源：{{ action.timestamps[0].source }}</div>
+                </td>
+                <td>{{ action.event }}</td>
+                <td>{{ action.engine }}</td>
+                <td>{{ "是" if action.executed else "否" }}</td>
+                <td>{{ action.after_state or "未提供" }}</td>
+                <td>{{ action.error or "未提供" }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+    {% endif %}
+</main>
+</body>
+</html>

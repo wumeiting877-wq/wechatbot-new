@@ -1,0 +1,368 @@
+{
+  "conversation": {
+    "id": "conv_zhiqun_demo01",
+    "platform": "WECHAT",
+    "conversation_type": "GROUP",
+    "display_name": "智群Demo"
+  },
+  "source": "智群 Demo + P4-G0 CASE-T01..T10",
+  "purpose": "P4 Task extraction only. Topics are pre-formed. Do not assert Risk/Decision. Do not auto DONE.",
+  "topics": [
+    {
+      "id": "topic_demo_erp",
+      "key": "A",
+      "title": "ERP 数据同步异常",
+      "summary": "增量同步仍有供应商编码空值"
+    },
+    {
+      "id": "topic_demo_perm",
+      "key": "B",
+      "title": "权限整改",
+      "summary": "质检员仍能看到采购价格"
+    },
+    {
+      "id": "topic_demo_demo",
+      "key": "C",
+      "title": "现场演示准备",
+      "summary": "周五现场演示需要离线包"
+    }
+  ],
+  "shared_rules": {
+    "assignee_id_forbidden": true,
+    "due_at_from_llm_forbidden": true,
+    "auto_done_forbidden": true,
+    "max_decisions_per_message": 5,
+    "v1_status_write": ["OPEN"]
+  },
+  "cases": [
+    {
+      "id": "CASE-T01",
+      "name": "明确负责人 + 截止时间",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0905",
+          "created_at": "2026-09-20T09:05:00+08:00",
+          "sender_name": "陈总",
+          "content": "ERP 增量同步的问题现在解决了吗？"
+        },
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_0908",
+        "created_at": "2026-09-20T09:08:00+08:00",
+        "sender_name": "周敏",
+        "content": "王强今天 16 点前把空值处理规则做完，再跑一次回归。"
+      },
+      "expected": {
+        "new_task_count": 1,
+        "update_count": 0,
+        "assignee_text": "王强",
+        "due_text_contains": "16 点",
+        "due_at": "",
+        "status": "OPEN",
+        "title_whitelist": ["处理供应商编码空值规则", "处理空值规则", "空值处理规则", "处理空值处理规则"],
+        "must_not_assignee": ["周敏"],
+        "must_not_create_second_task_for_regression": true
+      }
+    },
+    {
+      "id": "CASE-T02",
+      "name": "无负责人则不建 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_t02",
+        "created_at": "2026-09-20T09:08:30+08:00",
+        "sender_name": "周敏",
+        "content": "需要再跑一次回归。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "update_count": 0,
+        "allow_empty_assignee_task": false,
+        "decision": "UNRELATED"
+      }
+    },
+    {
+      "id": "CASE-T03",
+      "name": "无截止时间仍可建 Task",
+      "topic_id": "topic_demo_perm",
+      "existing_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0907",
+          "created_at": "2026-09-20T09:07:00+08:00",
+          "sender_name": "李娜",
+          "content": "权限页面这里也发现一个问题，质检员现在还能看到采购价格。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_t03",
+        "created_at": "2026-09-20T09:13:00+08:00",
+        "sender_name": "周敏",
+        "content": "李娜把权限问题修一下。"
+      },
+      "expected": {
+        "new_task_count": 1,
+        "assignee_text": "李娜",
+        "due_text": "",
+        "status": "OPEN",
+        "title_whitelist": ["修复质检权限问题", "修复权限问题", "修权限", "权限问题修复"]
+      }
+    },
+    {
+      "id": "CASE-T04",
+      "name": "一条消息两个 Task",
+      "topic_id": "topic_demo_erp",
+      "note": "v1 binds both tasks to the current primary topic. Cross-topic routing is out of scope.",
+      "existing_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_t04",
+        "created_at": "2026-09-20T09:08:10+08:00",
+        "sender_name": "周敏",
+        "content": "王强处理供应商编码，李娜修权限。"
+      },
+      "expected": {
+        "new_task_count": 2,
+        "tasks": [
+          { "assignee_text": "王强", "title_must_include_any": ["供应商", "编码", "空值"] },
+          { "assignee_text": "李娜", "title_must_include_any": ["权限"] }
+        ],
+        "all_topic_id": "topic_demo_erp",
+        "must_not_create_topic": true
+      }
+    },
+    {
+      "id": "CASE-T05",
+      "name": "更新截止不得新建重复 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [
+        {
+          "id": "task_demo_nullrule",
+          "title": "处理供应商编码空值规则",
+          "description": "空值处理规则并跑回归",
+          "assignee_text": "王强",
+          "due_text": "今天 16 点前",
+          "status": "OPEN",
+          "confidence": "HIGH"
+        }
+      ],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0908",
+          "created_at": "2026-09-20T09:08:00+08:00",
+          "sender_name": "周敏",
+          "content": "王强今天 16 点前把空值处理规则做完，再跑一次回归。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_t05",
+        "created_at": "2026-09-20T09:30:00+08:00",
+        "sender_name": "周敏",
+        "content": "改到 17 点前。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "update_count": 1,
+        "task_id": "task_demo_nullrule",
+        "due_text_contains": "17 点",
+        "open_task_count": 1
+      }
+    },
+    {
+      "id": "CASE-T06",
+      "name": "收到不得新建 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [
+        {
+          "id": "task_demo_nullrule",
+          "title": "处理供应商编码空值规则",
+          "assignee_text": "王强",
+          "due_text": "今天 16 点前",
+          "status": "OPEN"
+        }
+      ],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_demo_0920",
+        "created_at": "2026-09-20T09:20:00+08:00",
+        "sender_name": "赵凯",
+        "content": "收到。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "update_count": 0,
+        "decision": ["UNRELATED", "SKIPPED"],
+        "must_not_modify_existing": true
+      }
+    },
+    {
+      "id": "CASE-T07",
+      "name": "问题事实不得自动成为 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_t07",
+        "created_at": "2026-09-20T09:05:00+08:00",
+        "sender_name": "张三",
+        "content": "ERP 同步失败了。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "decision": "UNRELATED"
+      }
+    },
+    {
+      "id": "CASE-T08",
+      "name": "建议不得直接抽成 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [
+        {
+          "id": "task_demo_nullrule",
+          "title": "处理供应商编码空值规则",
+          "assignee_text": "王强",
+          "due_text": "今天 16 点前",
+          "status": "OPEN"
+        }
+      ],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0908",
+          "created_at": "2026-09-20T09:08:00+08:00",
+          "sender_name": "周敏",
+          "content": "王强今天 16 点前把空值处理规则做完，再跑一次回归。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_0914",
+        "created_at": "2026-09-20T09:14:00+08:00",
+        "sender_name": "王强",
+        "content": "我建议供应商编码缺失的数据先进异常池，不阻塞正常订单。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "must_not_title_contain": ["异常池"],
+        "decision": "UNRELATED",
+        "update_optional": true
+      }
+    },
+    {
+      "id": "CASE-T09",
+      "name": "确认执行必须结合上文，不得凭空补负责人",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [
+        {
+          "id": "task_demo_nullrule",
+          "title": "处理供应商编码空值规则",
+          "description": "空值处理规则并跑回归",
+          "assignee_text": "王强",
+          "due_text": "今天 16 点前",
+          "status": "OPEN"
+        }
+      ],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0908",
+          "created_at": "2026-09-20T09:08:00+08:00",
+          "sender_name": "周敏",
+          "content": "王强今天 16 点前把空值处理规则做完，再跑一次回归。"
+        },
+        {
+          "id": "msg_demo_0914",
+          "created_at": "2026-09-20T09:14:00+08:00",
+          "sender_name": "王强",
+          "content": "我建议供应商编码缺失的数据先进异常池，不阻塞正常订单。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_0915",
+        "created_at": "2026-09-20T09:15:00+08:00",
+        "sender_name": "周敏",
+        "content": "可以，先按照这个方案做，明天看看异常池数量。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "allowed_decisions": ["TASK_UPDATE", "UNRELATED"],
+        "if_update_task_id": "task_demo_nullrule",
+        "must_not_assignee": ["周敏"],
+        "must_not_invent_assignee": true
+      }
+    },
+    {
+      "id": "CASE-T09b",
+      "name": "无已有 Task 时单独确认不建 Task",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [],
+      "recent_topic_messages": [],
+      "current_message": {
+        "id": "msg_t09b",
+        "created_at": "2026-09-20T09:15:00+08:00",
+        "sender_name": "周敏",
+        "content": "可以，先按照这个方案做。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "decision": "UNRELATED"
+      }
+    },
+    {
+      "id": "CASE-T10",
+      "name": "完成表述不得自动 DONE",
+      "topic_id": "topic_demo_erp",
+      "existing_tasks": [
+        {
+          "id": "task_demo_nullrule",
+          "title": "处理供应商编码空值规则",
+          "assignee_text": "王强",
+          "due_text": "今天 16 点前",
+          "status": "OPEN"
+        }
+      ],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0908",
+          "created_at": "2026-09-20T09:08:00+08:00",
+          "sender_name": "周敏",
+          "content": "王强今天 16 点前把空值处理规则做完，再跑一次回归。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_t10",
+        "created_at": "2026-09-20T10:00:00+08:00",
+        "sender_name": "王强",
+        "content": "空值规则已经处理完了。"
+      },
+      "expected": {
+        "new_task_count": 0,
+        "status_after": "OPEN",
+        "auto_done": false,
+        "decision": "UNRELATED",
+        "must_not_decision": ["TASK_COMPLETE", "DONE"]
+      }
+    }
+  ]
+}

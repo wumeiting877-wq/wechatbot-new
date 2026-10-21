@@ -1,0 +1,154 @@
+{
+  "conversation": {
+    "id": "conv_zhiqun_demo01",
+    "platform": "WECHAT",
+    "conversation_type": "GROUP",
+    "display_name": "智群Demo"
+  },
+  "source": "P5-G0 mixed CASE-M01..M03",
+  "purpose": "One message may yield Task and/or Decision and/or Risk independently. Engines must not gate each other. Risk.task_id may be empty for same-message new Task.",
+  "topics": [
+    {
+      "id": "topic_demo_erp",
+      "key": "A",
+      "title": "ERP 数据同步异常",
+      "summary": "增量同步仍有供应商编码空值"
+    }
+  ],
+  "shared_rules": {
+    "engines_independent": true,
+    "one_message_multi_entity_allowed": true,
+    "risk_does_not_wait_for_task": true,
+    "decision_has_no_task_id": true
+  },
+  "cases": [
+    {
+      "id": "CASE-M01",
+      "name": "Decision + Risk",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "existing_risks": [],
+      "existing_tasks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_m01_suggest",
+          "created_at": "2026-09-22T10:20:00+08:00",
+          "sender_name": "王强",
+          "content": "我建议供应商编码缺失的数据先进异常池。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_m01_mix",
+        "created_at": "2026-09-22T10:25:00+08:00",
+        "sender_name": "周敏",
+        "content": "就按照异常池方案执行，如果今晚处理不完，会影响明天演示。"
+      },
+      "expected": {
+        "decision": {
+          "new_decision_count": 1,
+          "status": "RECORDED",
+          "created_by_message_id": "msg_demo_m01_mix",
+          "decision_text_contains": ["异常池"]
+        },
+        "risk": {
+          "new_risk_count": 1,
+          "status": "OPEN",
+          "condition_contains": ["处理不完"],
+          "impact_contains": ["演示"]
+        },
+        "task": {
+          "assert": false,
+          "note": "本句无明确负责人指派，P4 语义通常不建 Task；混合 CASE 不强制 Task"
+        },
+        "allowed": "1 Message → 1 Decision + 1 Risk"
+      }
+    },
+    {
+      "id": "CASE-M02",
+      "name": "Task + Risk",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "existing_risks": [],
+      "existing_tasks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_0906",
+          "created_at": "2026-09-20T09:06:00+08:00",
+          "sender_name": "王强",
+          "content": "昨晚同步链路已经跑通，不过还有 126 条供应商编码为空。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_m02_mix",
+        "created_at": "2026-09-22T15:00:00+08:00",
+        "sender_name": "周敏",
+        "content": "王强今天 17 点前处理，如果处理不完会影响今晚回归。"
+      },
+      "expected": {
+        "task": {
+          "new_task_count": 1,
+          "assignee_text": "王强",
+          "due_text_contains": "17 点",
+          "status": "OPEN",
+          "note": "P4 Task Engine already handles this shape; G1 Decision must not require Task code changes"
+        },
+        "risk": {
+          "new_risk_count": 1,
+          "status": "OPEN",
+          "condition_contains": ["处理不完"],
+          "impact_contains": ["回归"],
+          "task_id_may_be_null": true,
+          "reason": "parallel side-path cannot see the Task created from the same message"
+        },
+        "decision": {
+          "new_decision_count": 0
+        },
+        "allowed": "1 Message → 1 Task + 1 Risk"
+      }
+    },
+    {
+      "id": "CASE-M03",
+      "name": "Task + Decision",
+      "topic_id": "topic_demo_erp",
+      "existing_decisions": [],
+      "existing_risks": [],
+      "existing_tasks": [],
+      "candidate_tasks": [],
+      "recent_topic_messages": [
+        {
+          "id": "msg_demo_m03_suggest",
+          "created_at": "2026-09-22T10:20:00+08:00",
+          "sender_name": "王强",
+          "content": "我建议供应商编码缺失的数据先进异常池。"
+        }
+      ],
+      "current_message": {
+        "id": "msg_demo_m03_mix",
+        "created_at": "2026-09-22T10:30:00+08:00",
+        "sender_name": "周敏",
+        "content": "那就这么定，王强今天 17 点前处理。"
+      },
+      "expected": {
+        "decision": {
+          "new_decision_count": 1,
+          "status": "RECORDED",
+          "created_by_message_id": "msg_demo_m03_mix",
+          "has_task_id_field": false,
+          "decision_text_contains": ["异常池"]
+        },
+        "task": {
+          "new_task_count": 1,
+          "assignee_text": "王强",
+          "due_text_contains": "17 点",
+          "status": "OPEN"
+        },
+        "risk": {
+          "new_risk_count": 0
+        },
+        "allowed": "1 Message → 1 Decision + 1 Task"
+      }
+    }
+  ]
+}

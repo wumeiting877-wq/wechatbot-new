@@ -1,0 +1,109 @@
+{
+  "conversation": {
+    "id": "conv_zhiqun_demo01",
+    "platform": "WECHAT",
+    "conversation_type": "GROUP",
+    "display_name": "智群Demo"
+  },
+  "purpose": "P3 Topic boundary cases. Isolated runs; do not mix state across cases.",
+  "cases": [
+    {
+      "id": "CASE-01",
+      "name": "连续五条 ERP 讨论合并为一个 Topic",
+      "expected_topic_count": 1,
+      "messages": [
+        {"id": "case01_1", "sender_name": "张三", "content": "ERP 同步失败了"},
+        {"id": "case01_2", "sender_name": "李四", "content": "我看了日志，还是增量任务超时"},
+        {"id": "case01_3", "sender_name": "张三", "content": "超时发生在供应商主数据拉取"},
+        {"id": "case01_4", "sender_name": "李四", "content": "主数据接口返回 500"},
+        {"id": "case01_5", "sender_name": "张三", "content": "那我们先重启同步任务"}
+      ]
+    },
+    {
+      "id": "CASE-02",
+      "name": "ERP 中插入中午吃什么必须 UNRELATED",
+      "expected_topic_count": 1,
+      "messages": [
+        {"id": "case02_1", "sender_name": "张三", "content": "ERP 同步失败了", "expected_decision": "NEW_TOPIC"},
+        {"id": "case02_2", "sender_name": "李四", "content": "我看了日志，还是增量任务超时", "expected_decision": ["EXISTING_TOPIC", "TOPIC_UPDATE"]},
+        {"id": "case02_x", "sender_name": "王五", "content": "中午吃什么？", "expected_decision": "UNRELATED", "must_not_create_topic": true},
+        {"id": "case02_3", "sender_name": "张三", "content": "超时发生在供应商主数据拉取", "expected_decision": ["EXISTING_TOPIC", "TOPIC_UPDATE"]}
+      ]
+    },
+    {
+      "id": "CASE-03",
+      "name": "ERP 权限 ERP，最后一条回到原 ERP Topic",
+      "expected_topic_count": 2,
+      "messages": [
+        {"id": "case03_1", "sender_name": "陈总", "content": "ERP 增量同步还在报错", "expected_decision": "NEW_TOPIC", "expected_topic_key": "ERP"},
+        {"id": "case03_2", "sender_name": "李娜", "content": "权限页面质检员能看到采购价格", "expected_decision": "NEW_TOPIC", "expected_topic_key": "PERM"},
+        {"id": "case03_3", "sender_name": "王强", "content": "ERP 那边我继续查供应商编码", "expected_decision": ["EXISTING_TOPIC", "TOPIC_UPDATE"], "expected_topic_key": "ERP", "must_reuse_topic_of": "case03_1"}
+      ]
+    },
+    {
+      "id": "CASE-04",
+      "name": "用词变化仍同一 Topic",
+      "expected_topic_count": 1,
+      "messages": [
+        {"id": "case04_1", "sender_name": "甲", "content": "接口有问题", "expected_decision": "NEW_TOPIC"},
+        {"id": "case04_2", "sender_name": "乙", "content": "接口还是不通", "expected_decision": ["EXISTING_TOPIC", "TOPIC_UPDATE"], "must_not_create_topic": true}
+      ]
+    },
+    {
+      "id": "CASE-05",
+      "name": "隔 20 条后回到演示 Topic，依赖关键词召回而不只按时间取最近 5 个",
+      "seed_messages": [
+        {"id": "case05_demo", "sender_name": "赵凯", "content": "周五现场演示，客户希望 15:30 开始。", "expected_decision": "NEW_TOPIC", "expected_topic_key": "DEMO"}
+      ],
+      "gap": {
+        "count": 20,
+        "id_prefix": "case05_gap_",
+        "sender_name": "占位",
+        "content_template": "这条占位 {n}",
+        "inject_other_topic_at": 10,
+        "inject_message": {
+          "id": "case05_perm",
+          "sender_name": "李娜",
+          "content": "权限页面质检员还能看到采购价格。"
+        }
+      },
+      "final_message": {
+        "id": "case05_back",
+        "sender_name": "李娜",
+        "content": "演示账号已经建好了",
+        "expected_decision": ["EXISTING_TOPIC", "TOPIC_UPDATE"],
+        "must_reuse_topic_of": "case05_demo"
+      }
+    },
+    {
+      "id": "CASE-06",
+      "name": "acknowledgement 不创建 Topic",
+      "expected_topic_count": 0,
+      "messages": [
+        {"id": "case06_1", "sender_name": "甲", "content": "收到", "expected_decision": "UNRELATED"},
+        {"id": "case06_2", "sender_name": "乙", "content": "好的", "expected_decision": "UNRELATED"},
+        {"id": "case06_3", "sender_name": "丙", "content": "1", "expected_decision": "UNRELATED"},
+        {"id": "case06_4", "sender_name": "丁", "content": "嗯", "expected_decision": "UNRELATED"}
+      ]
+    },
+    {
+      "id": "CASE-07",
+      "name": "一条消息两个业务问题；v1 不支持 multi-topic",
+      "multi_topic_supported": false,
+      "seed_messages": [
+        {"id": "case07_a", "sender_name": "陈总", "content": "ERP 增量同步的问题现在解决了吗？", "expected_topic_key": "A"},
+        {"id": "case07_c", "sender_name": "赵凯", "content": "周五现场演示，客户希望 15:30 开始。", "expected_topic_key": "C"}
+      ],
+      "messages": [
+        {
+          "id": "case07_dual",
+          "sender_name": "王强",
+          "content": "ERP 数据问题处理完了，但是现场 Wi-Fi 还是不稳定。",
+          "expected_decision_count": 1,
+          "expected_topic_key": ["A", "C"],
+          "must_not_create_topic": true
+        }
+      ]
+    }
+  ]
+}
